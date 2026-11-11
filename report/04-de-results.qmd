@@ -1,0 +1,225 @@
+# Cre vs GFP: gene-level results
+
+Main-model results (batch term, cqn, one sample per mouse) shown as MA plots, volcanoes, counts, sample distances and PCA.
+
+```{r}
+#| include: false
+source("_common.R")   # chapters render from report/
+ckpt_load("03")
+```
+
+
+## MA plots
+
+```{r ma-plots, fig.width = 6.7, fig.height = 5}
+ma_df <- function(r) as_tibble(as.data.frame(r), rownames = "ensemblID") |>
+  mutate(sig = !is.na(padj) & padj < PADJ_CUT)     # same cut-off as every other test (0.05)
+
+plot_ma <- function(df, title) {
+  ggplot(df, aes(baseMean, pmax(pmin(log2FoldChange, 2), -2), colour = sig)) +
+    geom_point(size = 0.4, stroke = 0, alpha = 0.7) +
+    geom_hline(yintercept = 0, linewidth = 0.3) +
+    scale_x_log10() +
+    scale_colour_manual(values = c(`FALSE` = "grey70", `TRUE` = "#2166AC"), guide = "none") +
+    labs(title = title, x = "Mean of normalized counts", y = "log2 fold change") +
+    theme_bulk()
+}
+
+p_ma <- fits |>
+  mutate(pre  = map2(fit, tissue, \(f, t) plot_ma(ma_df(f$res),    sprintf("%s · before shrinkage", t))),
+         post = map2(fit, tissue, \(f, t) plot_ma(ma_df(f$resLFC), sprintf("%s · after shrinkage", t)))) |>
+  dplyr::select(pre, post) |> pmap(list) |> list_flatten() |>
+  wrap_plots(ncol = 2)
+save_plot(p_ma, file.path(FIG_DIR, "deseq2", "maplot_pre_post_shrink"), "full", 110)
+p_ma
+```
+
+## Volcano plots
+
+```{r volcano, fig.width = 6.7, fig.height = 4}
+# Not in the tutorial; standard companion to the MA plot. Genes of the candidate pathways are
+# coloured by pathway (first match if a gene is in several; OXPHOS = nuclear-encoded); candidate
+# genes (CANDIDATE GENES) are marked by tier; the top 3 per pathway by p value, any
+# padj < PADJ_CUT gene and every Tier 1 / Tier 2 candidate gene are labelled.
+plot_volcano <- function(de, tissue) {
+  df <- de |> dplyr::filter(!is.na(padj)) |>
+    left_join(cand_member, by = "ensemblID") |>
+    mutate(pathway = factor(replace_na(pathway, "Other"), levels = c(names(CANDIDATE_TERMS), "Other")),
+           sig = padj < PADJ_CUT)
+  tiers <- dplyr::filter(cand_genes, tissue == !!tissue)
+  df  <- df |> left_join(dplyr::select(tiers, ensemblID, tier), by = "ensemblID")
+  lab <- bind_rows(df |> dplyr::filter(pathway != "Other") |> group_by(pathway) |>
+                     slice_min(pvalue, n = 3, with_ties = FALSE) |> ungroup(),
+                   dplyr::filter(df, sig | !is.na(tier))) |> dplyr::distinct(ensemblID, .keep_all = TRUE)
+  ggplot(df, aes(log2FoldChange_shrunk, -log10(padj))) +
+    geom_point(data = dplyr::filter(df, pathway == "Other"), colour = "grey80", size = 0.4, stroke = 0) +
+    geom_point(data = dplyr::filter(df, pathway != "Other"), aes(colour = pathway), size = 0.7,
+               alpha = 0.85, stroke = 0) +
+    geom_point(data = dplyr::filter(df, sig), shape = 21, colour = "black", fill = NA, size = 1.2, stroke = 0.3) +
+    geom_point(data = dplyr::filter(df, !is.na(tier)), aes(shape = tier), colour = "black", size = 1.4,
+               stroke = 0.3) +
+    scale_shape_manual(values = c(`Tier 1` = 5, `Tier 2` = 4), name = NULL) +
+    geom_hline(yintercept = -log10(PADJ_CUT), linetype = 2, linewidth = 0.25) +
+    geom_text_repel(data = lab, aes(label = Symbol, colour = pathway), size = pt(6), show.legend = FALSE,
+                    segment.size = 0.2, max.overlaps = Inf, min.segment.length = 0) +
+    scale_colour_manual(values = c(CANDIDATE_COLS, Other = "black"), drop = FALSE,
+                        breaks = names(CANDIDATE_TERMS)) +
+    labs(title = tissue, x = "Shrunken log2 fold change (Cre / GFP)", y = "-log10 FDR", colour = NULL) +
+    theme_bulk() + theme(legend.position = "bottom") +
+    guides(colour = guide_legend(nrow = 2, override.aes = list(size = 1.5)))
+}
+p_volc <- map2(fits$de, fits$tissue, plot_volcano) |> wrap_plots(nrow = 1, guides = "collect") &
+  theme(legend.position = "bottom")
+save_plot(p_volc, file.path(FIG_DIR, "deseq2", "volcano_cre_vs_gfp"), "full", 100)
+p_volc
+
+# DEG volcano for the 2025-10-run test (Cre vs switch GFP; CANDIDATE GENES), where the DEGs are:
+# unshrunk log2FC, padj < PADJ_CUT genes filled by direction, candidate-pathway genes coloured,
+# every DEG labelled.
+plot_volcano_oct <- function(tissue) {
+  df  <- dplyr::filter(cand_genes_all, tissue == !!tissue, !is.na(padj_oct)) |>
+    mutate(pathway = factor(replace_na(pathway, "Other"), levels = c(names(CANDIDATE_TERMS), "Other")),
+           direction = case_when(padj_oct < PADJ_CUT & log2FC_oct > 0 ~ "Up in Cre",
+                                 padj_oct < PADJ_CUT & log2FC_oct < 0 ~ "Down in Cre", TRUE ~ "NS"))
+  lab <- dplyr::filter(df, direction != "NS")
+  ggplot(df, aes(log2FC_oct, -log10(padj_oct))) +
+    geom_point(data = dplyr::filter(df, pathway == "Other", direction == "NS"), colour = "grey80",
+               size = 0.4, stroke = 0) +
+    geom_point(data = dplyr::filter(df, pathway != "Other", direction == "NS"), aes(colour = pathway),
+               size = 0.6, alpha = 0.7, stroke = 0) +
+    geom_point(data = lab, aes(fill = direction), shape = 21, colour = "black", size = 1.4, stroke = 0.25) +
+    geom_hline(yintercept = -log10(PADJ_CUT), linetype = 2, linewidth = 0.25) +
+    geom_text_repel(data = lab, aes(label = Symbol), size = pt(6), colour = "black",
+                    segment.size = 0.2, max.overlaps = Inf, min.segment.length = 0) +
+    scale_colour_manual(values = CANDIDATE_COLS, name = NULL) +
+    scale_fill_manual(values = c(`Up in Cre` = GROUP_COLS[["Cre"]], `Down in Cre` = GROUP_COLS[["GFP"]]),
+                      name = NULL) +
+    labs(title = sprintf("%s · 2025-10 run: Cre vs switch GFP (%d DEGs)", tissue, nrow(lab)),
+         x = "log2 fold change (Cre / GFP)", y = "-log10 FDR") +
+    theme_bulk() + theme(legend.position = "bottom") +
+    guides(colour = guide_legend(nrow = 2, override.aes = list(size = 1.5)))
+}
+p_volc_oct <- map(TISSUES, plot_volcano_oct) |> wrap_plots(nrow = 1, guides = "collect") &
+  theme(legend.position = "bottom")
+save_plot(p_volc_oct, file.path(FIG_DIR, "deseq2", "volcano_2025_10_cre_vs_gfp"), "full", 100)
+p_volc_oct
+```
+
+## Normalised counts
+
+```{r plot-counts, fig.width = 6.7, fig.height = 4}
+# Tutorial plotCounts(): normalized counts for hAPOE + the top 5 DEGs per tissue
+count_df <- function(fit, de, tissue, n = 5) {
+  genes <- unique(c(HUMAN_APOE,
+                    de |> dplyr::filter(padj < PADJ_CUT) |> slice_min(padj, n = n) |> pull(ensemblID)))
+  genes <- intersect(genes, rownames(fit$dds))
+  # offset-corrected counts for every AAV sample, so the 2025-10 GFP check samples show too
+  map(genes, \(g) plotCounts(fit$dds_display, gene = g, intgroup = c("cmp_group", "sex"),
+                             returnData = TRUE) |>
+        mutate(ensemblID = g)) |>
+    bind_rows() |>
+    left_join(dplyr::select(id2name, ensemblID, Symbol), by = "ensemblID") |>
+    mutate(tissue = tissue)
+}
+
+counts_long <- pmap(list(fits$fit, fits$de, fits$tissue), count_df) |> bind_rows()
+p_counts <- ggplot(counts_long, aes(cmp_group, count, colour = cmp_group)) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.3, width = 0.6, colour = "grey40") +
+  geom_point(aes(shape = sex), size = 0.9, position = position_jitter(width = 0.15, seed = 1)) +
+  facet_wrap(~ tissue + Symbol, scales = "free_y", nrow = 2) +
+  scale_y_log10() +
+  scale_x_discrete(labels = c(`Cre (2025-10)` = "Cre", `GFP (2025-04)` = "GFP",
+                              `GFP check (2025-10)` = "GFP\ncheck")) +
+  scale_colour_manual(values = CMP_COLS, guide = "none") +
+  scale_shape_manual(values = c(Female = 1, Male = 16)) +
+  labs(x = NULL, y = "Normalized count", shape = NULL) +
+  theme_bulk() + theme(legend.position = "top")
+save_plot(p_counts, file.path(FIG_DIR, "deseq2", "normalized_count_examples"), "full", 90)
+p_counts
+```
+
+## Sample distances
+
+```{r sample-heatmaps}
+# Tutorial: rlog -> sample distance + Pearson correlation heatmaps. All AAV samples of the
+# tissue, with the bridge-estimated run offset applied to the 2025-04 samples (the same
+# normalization factors the primary test uses), so the 2025-10 GFP check samples should sit
+# among the 2025-04 GFP if the correction worked.
+anno_cols <- list(cmp_group = CMP_COLS, sex = c(Female = "grey30", Male = "grey80"))
+
+sample_heatmaps <- function(fit, tissue) {
+  rld  <- rlog(fit$dds_display, blind = TRUE)
+  ann  <- as.data.frame(colData(rld))[, c("cmp_group", "sex")]
+  d    <- dist(t(assay(rld)))
+  dmat <- as.matrix(d)
+  common <- list(annotation_col = ann, annotation_colors = anno_cols, fontsize = 6,
+                 fontfamily = FONT, border_color = NA, treeheight_row = 10,
+                 treeheight_col = 10, silent = TRUE)
+  ph_dist <- do.call(pheatmap, c(list(dmat, clustering_distance_rows = d,
+                                      clustering_distance_cols = d,
+                                      color = colorRampPalette(rev(RColorBrewer::brewer.pal(9, "Blues")))(255),
+                                      main = tissue), common))
+  ph_cor  <- do.call(pheatmap, c(list(cor(assay(rld), method = "pearson"), main = tissue), common))
+  save_pheatmap(ph_dist, file.path(FIG_DIR, "qc", sprintf("distance_sample_heatmap_%s", tolower(tissue))))
+  save_pheatmap(ph_cor,  file.path(FIG_DIR, "qc", sprintf("similarity_sample_heatmap_%s", tolower(tissue))))
+  list(rld = rld, dist = ph_dist, cor = ph_cor)
+}
+
+rlds <- map2(fits$fit, fits$tissue, sample_heatmaps) |> set_names(fits$tissue)
+walk(rlds, \(x) { grid::grid.newpage(); grid::grid.draw(x$dist$gtable) })
+```
+
+## PCA
+
+```{r pca, fig.width = 6.7, fig.height = 3}
+# Not in the tutorial; PCA on the same run-offset-corrected rlog values
+plot_pca <- function(rld, tissue) {
+  df <- plotPCA(rld, intgroup = c("cmp_group", "sex"), returnData = TRUE)
+  ve <- round(100 * attr(df, "percentVar"), 1)
+  ggplot(df, aes(PC1, PC2, colour = cmp_group, shape = sex)) +
+    geom_point(size = 1.6) +
+    geom_text_repel(aes(label = name), size = pt(6), show.legend = FALSE,
+                    segment.size = 0.2, max.overlaps = Inf) +
+    scale_colour_manual(values = CMP_COLS) +
+    scale_shape_manual(values = c(Female = 17, Male = 16)) +
+    labs(title = tissue, x = sprintf("PC1 (%s%%)", ve[1]), y = sprintf("PC2 (%s%%)", ve[2]),
+         colour = NULL, shape = NULL) +
+    theme_bulk()
+}
+p_pca <- imap(rlds, \(x, t) plot_pca(x$rld, t)) |>
+  wrap_plots(nrow = 1, guides = "collect") & theme(legend.position = "bottom")
+save_plot(p_pca, file.path(FIG_DIR, "qc", "pca_rlog"), "full", 80)
+p_pca
+```
+
+## Significant-gene heatmap
+
+```{r sig-gene-heatmap}
+# Tutorial: heatmap of significant genes (rlog): the top 50 genes by padj among
+# padj < PADJ_CUT (0.05), row-scaled.
+sig_heatmap <- function(rld, de, tissue, n = 50) {
+  top <- de |> dplyr::filter(padj < PADJ_CUT) |> slice_min(padj, n = n, with_ties = FALSE)
+  if (nrow(top) < 2) return(NULL)
+  mat <- assay(rld)[top$ensemblID, ]
+  rownames(mat) <- top$Symbol
+  ann <- as.data.frame(colData(rld))[, c("cmp_group", "sex")]
+  ord <- order(ann$cmp_group, ann$sex)
+  ph <- pheatmap(mat[, ord], scale = "row", cluster_cols = FALSE, annotation_col = ann[ord, ],
+                 annotation_colors = anno_cols,
+                 gaps_col = cumsum(table(ann$cmp_group))[-nlevels(ann$cmp_group)],
+                 color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(101),
+                 breaks = seq(-2, 2, length.out = 102), fontsize = 6, fontfamily = FONT,
+                 border_color = NA, treeheight_row = 10, main = tissue, silent = TRUE)
+  save_pheatmap(ph, file.path(FIG_DIR, "deseq2", sprintf("sig_gene_heatmap_%s", tolower(tissue))),
+                "single", max(60, 2.6 * nrow(top) + 30))
+  ph
+}
+sig_hms <- pmap(list(map(rlds, "rld"), fits$de, fits$tissue), sig_heatmap) |> compact()
+walk(sig_hms, \(ph) { grid::grid.newpage(); grid::grid.draw(ph$gtable) })
+```
+
+
+```{r}
+#| include: false
+ckpt_save("04")
+```

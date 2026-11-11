@@ -1,0 +1,48 @@
+# Overview {.unnumbered}
+
+Bulk RNA-seq of liver (A1–A22) and brain (B1–B22) from the EFAD follow-up cohort (Novogene X202SC25088042). The data were processed on MCC following the Griffith lab RNA-seq course (rnabio.org):
+
+- fastp adapter trimming → HISAT2 → htseq-count / StringTie → DESeq2 → clusterProfiler.
+- The gene counts used for the analysis come from STAR 2.7.11b (GeneCounts) on the same trimmed reads. HISAT2 + htseq-count is kept as an internal comparison.
+- Reference: GRCm39 (Ensembl 116), with mouse *Apoe* masked. Contigs are added for human *APOE* (`hAPOE`, GRCh38 E3 locus), Cre, EGFP, and the 5xFAD human APP / PSEN1 transgenes.
+- The AAV's iCre (AY056050) is counted from unaligned reads.
+- Processing scripts are in `mcc_pipeline/scripts/`, run from `/pscratch/lajo247_uksr/efad_bulkseq/scripts` on MCC.
+
+## The model
+
+The mice carry humanised *APOE4* that Cre recombination converts to *APOE2*. A single dose of AAV-TBG-EGFP-T2A-iCre switches hepatocytes from E4 to E2. The brain keeps E4. Control mice receive AAV-TBG-GFP.
+
+The liver is the main source of plasma apoE, so the switch changes the apoE isoform on hepatic lipoproteins:
+
+- apoE2 binds the LDL receptor poorly (remnant clearance, hepatocyte cholesterol delivery);
+- apoE isoform affects VLDL-triglyceride secretion, hepatic lipid handling and inflammation.
+
+Brain tissue is the within-animal negative control. The switch acts in hepatocytes, so a "Cre effect" of the same size in brain points to genetic background, a systemic or technical effect, or chance.
+
+## Samples and design
+
+**Primary comparison:** Cre-AAV vs GFP-AAV, run separately in liver and brain. Two Novogene runs are combined, both processed here from raw FASTQ with the same pipeline:
+
+- **2025-10** (X202SC25088042): 10 Cre + 3 GFP mice per tissue, in RNA extraction batches 1 and 2. This run also holds 12-month EFAD germline E2 / E3 / E4 mice, which are not used as controls for the switch.
+- **2025-04** (X202SC25043333, samples prefixed `R1_`): only the 10 GFP mice per tissue are used. The 2025-04 Cre samples are excluded because they were different mice that were misgenotyped. Extraction batch `R1`.
+
+Two GFP mice, SAD_326 and MAD_271, were sequenced in both runs. They are bridge replicates of the same animals, and every model uses one sample per mouse. Brain B13 is excluded: it is not SAD_326 (APOE genotype mismatch).
+
+**The central problem:** every Cre mouse was sequenced in 2025-10, while most GFP controls were sequenced in 2025-04. The main model therefore includes a batch term that fully removes the run difference. With the run removed, the Cre-vs-GFP fold change rests on the three GFP mice sequenced in 2025-10. The 2025-04 GFP mice add replication to the variance estimates.
+
+## How this book is organised
+
+| Chapter | What it covers |
+|---|---|
+| 1. Data, sample identity and QC | parameters, import, construct / hAPOE / iCre per sample, sample and gene QC |
+| 2. The sequencing run and its correction | how large the run difference is, the main model, aligner comparison, batch-correction benchmark |
+| 3. Confound-resistant checks | replicate false-positive floor, RUVs, germline EFAD benchmark, within-Cre dose-response, 2025-10-only candidates |
+| 4. Gene-level results | MA plots, volcanoes, counts, sample distances, PCA |
+| 5. Pathway analysis | GO GSEA, leave-one-out robustness, ORA |
+| 6. Effect-size candidates | genes and pathways with a ≥ 1.5-fold effect that are not significant, with every line of evidence per gene / set |
+| 7. Switched mice vs germline E2 / E4 | APOE genotype per group, PCA, E2-likeness, direct DEGs, gene and pathway concordance, candidate-gene heatmap (2025-10 samples only) |
+| 8. Head-to-head with the previous analysis | the earlier pipeline rerun and compared gene by gene |
+
+Code is folded under each result ("Code"). Tables are paged. Every figure is also saved at print size in `figures/` (pdf + png), and every table in `csv/`.
+
+**Rendering:** run `quarto render report/` from the project root. Chapters run in order and hand their workspace to the next chapter through `objects/checkpoints/` (see `report/_common.R`).

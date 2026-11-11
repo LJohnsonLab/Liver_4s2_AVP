@@ -1,0 +1,147 @@
+# Head-to-head with the previous analysis
+
+The earlier analysis (DE analysis I, 2025-10-24) rerun on this project's counts and compared gene by gene.
+
+```{r}
+#| include: false
+source("_common.R")   # chapters render from report/
+ckpt_load("07")
+```
+
+## Reproducing the previous pipeline
+
+The earlier analysis (ljohnsonlab.github.io/4s2_liver, "Differential Expression Analysis I")
+reproduced on this project's counts, then compared gene by gene with both its published tables
+(saved in `objects/reference/previous_DE_analysis1/`) and with the analysis above.
+
+Previous pipeline, as described on that page: nf-core/rnaseq (stock GRCm39, Ensembl 114, no
+transgene / human APOE contigs); Batch 1 (2025-04 GFP) and Batch 2 (2025-10 Cre + GFP) analysed
+together; technical replicates collapsed by averaging counts; genes kept with >= 20 counts in
+>= 5 samples; DESeq2 `~ Sex + group`, **no batch term**; DEG = FDR < 0.01 and |log2FC| > 1;
+"high-confidence" = DEGs after removing -ps / -rs pseudogenes, Gm / Rik / unannotated loci,
+mt- and Rp genes. Reproduced here exactly, except the counts (STAR on the custom reference) and
+the sample list as recorded at the time (B13 included, as it was then).
+
+```{r previous-pipeline}
+prev_dir <- file.path(IN_DIR, "reference", "previous_DE_analysis1")
+prev <- map(set_names(c("liver_all", "liver_hc", "brain_all", "brain_hc")),
+            \(x) read_tsv(file.path(prev_dir, sprintf("prev_%s.tsv", x)), show_col_types = FALSE))
+meta_all <- read_csv(file.path(IN_DIR, "sample_metadata.csv"), show_col_types = FALSE) |>
+  mutate(sex = factor(sex), group = factor(group, levels = c("GFP Control", "Cre-AAV")))
+hc_drop <- "-ps\\d*$|-rs\\d*$|^Gm\\d+|Rik\\d*$|^ENSMUS|^mt-|^Rp[ls]"
+allCounts <- read_counts(COUNT_SOURCE)      # full matrix: B13 is part of the reproduction
+
+prev_pipeline <- function(tissue) {
+  m <- meta_all |> dplyr::filter(tissue == !!tissue, arm == "AAV")      # B13 included, as then
+  # collapse technical replicates (same mouse in both runs) by averaging counts
+  cts <- allCounts[setdiff(rownames(allCounts), CONSTRUCT_GENES), m$sample]
+  by_mouse <- split(m$sample, m$mouse_id)
+  cm <- sapply(by_mouse, \(s) round(rowMeans(cts[, s, drop = FALSE])))
+  mm <- m |> dplyr::distinct(mouse_id, .keep_all = TRUE) |> column_to_rownames("mouse_id")
+  mm <- mm[colnames(cm), ]
+  cm <- cm[rowSums(cm >= 20) >= 5, ]                                    # >= 20 counts in >= 5 samples
+  r <- DESeqDataSetFromMatrix(cm, mm, ~ sex + group) |> DESeq(quiet = TRUE) |>
+    results(name = "group_Cre.AAV_vs_GFP.Control")
+  tibble(ensemblID = rownames(r), baseMean = r$baseMean, log2FC = r$log2FoldChange, padj = r$padj) |>
+    left_join(dplyr::select(id2name, ensemblID, Symbol), by = "ensemblID") |>
+    mutate(Symbol = coalesce(Symbol, ensemblID),
+           deg = !is.na(padj) & padj < 0.01 & abs(log2FC) > 1,
+           hc  = deg & !str_detect(Symbol, hc_drop))
+}
+repro <- map(set_names(TISSUES), prev_pipeline)
+
+# same-mouse run difference (2025-10 minus 2025-04) from the double-run mice, for every gene:
+# a "DEG" pointing the same way as this is what the run alone would produce
+run_diff_tissue <- function(tissue) {
+  m  <- meta_all |> dplyr::filter(tissue == !!tissue, arm == "AAV", sample != "B13")
+  pr <- m |> group_by(mouse_id) |> dplyr::filter(n_distinct(run) == 2) |> ungroup()
+  y  <- log2(t(t(allCounts[, pr$sample]) / estimateSizeFactorsForMatrix(allCounts[, pr$sample])) + 1)
+  d  <- map(split(pr, pr$mouse_id), \(b) y[, b$sample[b$run == CRE_RUN]] - y[, b$sample[b$run == GFP_RUN]])
+  tibble(ensemblID = rownames(y), run_diff = purrr::reduce(d, `+`) / length(d))
+}
+
+h2h_tissue <- function(tissue) {
+  t  <- tolower(tissue)
+  rp <- repro[[tissue]]
+  cur_main <- fits$de[[match(tissue, fits$tissue)]] |> dplyr::select(ensemblID, padj_current = padj,
+                                                                    log2FC_current = log2FoldChange_shrunk)
+  cur_oct  <- cand_genes_all |> dplyr::filter(tissue == !!tissue) |>
+    dplyr::select(ensemblID, log2FC_oct, padj_oct, tier)
+  prev[[paste0(t, "_hc")]] |>
+    dplyr::rename(Symbol = gene, log2FC_prev = log2FoldChange, padj_prev = padj) |>
+    mutate(Symbol = if_else(Symbol == "APOE", "hAPOE", Symbol)) |>
+    left_join(dplyr::select(rp, ensemblID, Symbol, log2FC_repro = log2FC, padj_repro = padj, deg_repro = deg) |>
+                dplyr::distinct(Symbol, .keep_all = TRUE), by = "Symbol") |>
+    left_join(run_diff_tissue(tissue), by = "ensemblID") |>
+    left_join(cur_main, by = "ensemblID") |> left_join(cur_oct, by = "ensemblID") |>
+    mutate(tissue = tissue,
+           follows_run = sign(run_diff) == sign(log2FC_prev) & abs(run_diff) > 0.5,
+           # all of these symbols exist in the annotation; they fail the >= 20-count filter here
+           # because STAR GeneCounts / htseq count uniquely-mapped reads only, and their previous
+           # "expression" was largely multi-mapped reads (retrogenes, multi-copy RNAs, paralogs)
+           verdict = case_when(is.na(ensemblID) ~ "too few uniquely-mapped reads to test",
+                               !is.na(tier) ~ paste("candidate here:", tier),
+                               follows_run %in% TRUE ~ "run artifact (same-mouse run difference, same direction)",
+                               TRUE ~ "not supported once run is controlled")) |>
+    relocate(tissue, Symbol, verdict)
+}
+h2h <- map(TISSUES, h2h_tissue) |> bind_rows()
+write_csv(h2h, file.path(CSV_DIR, "deseq2", "head_to_head_previous_hc_genes.csv"))
+
+# summary: published vs reproduced vs current
+h2h_summary <- map(TISSUES, \(tissue) {
+  t <- tolower(tissue); rp <- repro[[tissue]]
+  prev_all <- prev[[paste0(t, "_all")]]$gene; prev_hc <- prev[[paste0(t, "_hc")]]$gene
+  tibble(tissue,
+         published_DEGs = length(prev_all), reproduced_DEGs = sum(rp$deg),
+         published_hc = length(prev_hc), reproduced_hc = sum(rp$hc),
+         hc_overlap = length(intersect(prev_hc, rp$Symbol[rp$hc])),
+         r_log2FC_published_vs_reproduced = {
+           j <- inner_join(prev[[paste0(t, "_all")]], rp, by = c(gene = "Symbol"))
+           cor(j$log2FoldChange, j$log2FC) },
+         hc_following_run_pct = 100 * mean(dplyr::filter(h2h, tissue == !!tissue)$follows_run, na.rm = TRUE),
+         current_main_DEGs = sum(fits$de[[match(tissue, fits$tissue)]]$padj < PADJ_CUT, na.rm = TRUE),
+         current_2025_10_DEGs = sum(cand_genes_all$tissue == tissue & cand_genes_all$sig_oct))
+}) |> bind_rows()
+write_csv(h2h_summary, file.path(CSV_DIR, "deseq2", "head_to_head_summary.csv"))
+h2h_summary
+h2h |> dplyr::count(tissue, verdict)
+h2h |> dplyr::filter(Symbol %in% c("hAPOE", "Eno1b", "Uba52rt", "Adrm1b", "Kpna2rt", "Ube2srt", "Hspb1")) |>
+  dplyr::select(tissue, Symbol, verdict, log2FC_prev, log2FC_repro, run_diff, padj_current, padj_oct) |>
+  mutate(across(where(is.numeric), \(x) signif(x, 2)))
+```
+
+## Gene-by-gene comparison
+
+```{r head-to-head-plot, fig.width = 6.7, fig.height = 3.2}
+p_h2h <- h2h |> dplyr::filter(!is.na(run_diff)) |>
+  ggplot(aes(run_diff, log2FC_prev, colour = verdict)) +
+  geom_hline(yintercept = 0, linewidth = 0.25) + geom_vline(xintercept = 0, linewidth = 0.25) +
+  geom_point(size = 1) +
+  geom_text_repel(data = \(d) dplyr::filter(d, Symbol %in% c("hAPOE", "Eno1b", "Uba52rt", "Adrm1b") |
+                                               str_starts(verdict, "candidate")),
+                  aes(label = Symbol), size = pt(6), show.legend = FALSE, segment.size = 0.2,
+                  max.overlaps = Inf) +
+  facet_wrap(~ tissue) +
+  scale_colour_manual(values = c("run artifact (same-mouse run difference, same direction)" = "#B2182B",
+                                 "not supported once run is controlled" = "grey50",
+                                 "candidate here: Tier 1" = "#1B7837", "candidate here: Tier 2" = "#5AAE61",
+                                 "too few uniquely-mapped reads to test" = "grey80")) +
+  labs(x = "Same-mouse run difference, log2 (2025-10 - 2025-04)",
+       y = "Previous analysis log2FC (Cre / GFP)", colour = NULL) +
+  theme_bulk() + theme(legend.position = "bottom") + guides(colour = guide_legend(ncol = 2))
+save_plot(p_h2h, file.path(FIG_DIR, "deseq2", "head_to_head_previous_hc_genes"), "full", 95)
+p_h2h
+```
+
+
+## Session info
+
+```{r session}
+sessionInfo()
+```
+
+```{r}
+#| include: false
+ckpt_save("08")
+```

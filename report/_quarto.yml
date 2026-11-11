@@ -1,0 +1,45 @@
+project:
+  type: book
+  output-dir: _book
+
+book:
+  title: "Liver Switch BulkSeq Analysis"
+  subtitle: "Liver-specific APOE4 → APOE2 switch: Cre-AAV vs GFP-AAV, liver and brain"
+  author: "Akhil Pallerla"
+  date: today
+  chapters:
+    - index.qmd
+    - part: "Data and quality control"
+      chapters:
+        - 01-data-qc.qmd
+    - part: "Sequencing run and validity"
+      chapters:
+        - 02-run-correction.qmd
+        - 03-validity.qmd
+    - part: "Cre vs GFP"
+      chapters:
+        - 04-de-results.qmd
+        - 05-pathways.qmd
+        - 06-effect-size.qmd
+    - part: "Comparison"
+      chapters:
+        - 07-germline.qmd
+        - 08-previous.qmd
+    - references.qmd
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-summary: "Code"
+    df-print: paged
+    fig-align: center
+
+execute:
+  freeze: auto      # unchanged chapters reuse their last output; checkpoints stay on disk
+  echo: true
+  warning: false
+  message: false

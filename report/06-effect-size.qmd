@@ -1,0 +1,462 @@
+# Effect-size candidates (not significant) {#sec-effect-size}
+
+Genes and pathways with a biologically sized Cre effect that do not reach padj < 0.05, laid out with every line of evidence so the choice of what to report can be made on the evidence.
+
+```{r}
+#| include: false
+source("_common.R")   # chapters render from report/
+ckpt_load("05")
+```
+
+## Criteria and liver APOE biology
+
+The main model finds no gene at padj < 0.05, which is expected with three batch-control GFP mice. This chapter collects every gene and pathway with a Cre-vs-GFP effect of at least 1.5-fold that does **not** reach significance. Each one comes with every line of evidence this dataset offers, so you can judge it.
+
+Nothing here is an FDR-controlled discovery. The list is hypothesis-generating: candidates for a justified write-up and for qPCR. The criteria select the list; the evidence columns only describe it, and no gene is dropped for failing one.
+
+**Criteria** (all parameters below):
+
+| Criterion | Default | Why |
+|---|---|---|
+| Effect size | \|log2FC\| ≥ log2(1.5) in the main model | the conventional minimum meaningful fold change; main model = batch-corrected, all controls |
+| Expression | baseMean ≥ 20 | below this a 1.5-fold change is a handful of reads |
+| Not significant | padj ≥ 0.05 | significant genes are already in chapter 4 |
+| Direction holds | same sign in the 2025-10-only test and in every leave-one-GFP-out refit | the sign cannot rest on one control mouse or on the run correction |
+
+**Biological context.** The switch replaces apoE4 with apoE2 on hepatocyte lipoproteins. The gene sets below follow from that biology:
+
+- receptor-mediated lipoprotein clearance (apoE2 binds LDLR poorly);
+- hepatocyte cholesterol sensing (SREBP2) and efflux;
+- VLDL assembly and triglyceride handling;
+- fatty-acid oxidation and synthesis;
+- bile acids;
+- ceramides (raised in these mice's plasma lipidomics);
+- acute-phase / ER-stress responses.
+
+Three sets were added *after* looking at this dataset: OXPHOS, the urea cycle (Ass1 / Asl) and interferon-γ response (Irgm / Gbp genes). They are kept as a separate family and cannot be presented as pre-specified.
+
+```{r effect-size-params}
+# Effect-size candidates: genes / pathways whose Cre-vs-GFP effect is as large as a biologically
+# meaningful change but that do not reach padj < PADJ_CUT. Every threshold is here so it can be
+# changed; nothing below decides what is biologically important.
+ES_LFC        <- log2(1.5)   # |batch-corrected log2FC| >= 1.5-fold (main model, unshrunk MLE)
+ES_MIN_MEAN   <- 20          # baseMean floor: below this a 1.5-fold change is a few reads
+ES_CONSISTENT <- TRUE        # also require the same sign in the 2025-10-only test and in every
+                             # leave-one-GFP-out refit (direction cannot hinge on one control)
+ES_GSEA_FDR   <- 0.25        # exploratory GSEA cut-off recommended by Subramanian et al. 2005
+ES_NES        <- 1.5         # |NES| floor for genome-wide near-miss GO terms
+ES_SHOW_OTHER <- 15          # candidates outside the APOE-liver sets shown in the figure (top |LFC|)
+
+# Liver APOE biology. An E4 -> E2 switch in hepatocytes changes the apoE on hepatic lipoproteins:
+# apoE2 binds the LDL receptor poorly (remnant clearance, hepatocyte cholesterol delivery and so
+# SREBP2 signalling), and apoE isoform changes VLDL-triglyceride secretion, hepatic lipid handling
+# and inflammation (Mahley & Rall 2000; Mahley 2016). Plasma lipids, ceramides and triglycerides
+# rose in these mice (lipidomics). "a priori" sets follow from that biology; "this data" sets were
+# picked after seeing this dataset (OXPHOS and immune GSEA, Ass1 / Asl / Irgm2 genes) and cannot be
+# claimed as pre-specified.
+APOE_LIVER_SETS <- tribble(
+  ~set,                                   ~go,          ~basis,
+  "Lipoprotein assembly / VLDL secretion", "GO:0034377", "a priori",
+  "Lipoprotein clearance (LDLR / LRP1)",   "GO:0034381", "a priori",
+  "Cholesterol biosynthesis (SREBP2)",     "GO:0006695", "a priori",
+  "Cholesterol efflux",                    "GO:0033344", "a priori",
+  "Bile acid metabolism",                  "GO:0008206", "a priori",
+  "Fatty acid beta-oxidation (PPARa)",     "GO:0006635", "a priori",
+  "Fatty acid synthesis (SREBP1c)",        "GO:0006633", "a priori",
+  "Triglyceride metabolism",               "GO:0006641", "a priori",
+  "Ceramide biosynthesis",                 "GO:0046513", "a priori",
+  "Acute-phase response",                  "GO:0006953", "a priori",
+  "ER unfolded protein response",          "GO:0030968", "a priori",
+  "OXPHOS (nuclear)",                      "GO:0006119", "this data",
+  "Urea cycle",                            "GO:0000050", "this data",
+  "Response to interferon-gamma",          "GO:0034341", "this data")
+```
+
+## Genes
+
+**Evidence per gene** (columns `ev_*` in `csv/deseq2/effect_size_candidates.csv`):
+
+- **p < 0.05, main model** / **p < 0.05, 2025-10 only**: nominal (unadjusted) p values in the batch-corrected model and in the run-free 2025-10-only model.
+- **Dose**: within the Cre mice only, the slope of expression on each mouse's liver E2 allelic fraction, in the same direction as the Cre effect (and p < 0.05). Batch cannot drive a within-group gradient, but the E2 range is narrow (about 0.87–0.96).
+- **Germline E2 vs E4**: same direction as EFAD E2/E2 vs E4/E4 liver. Those mice are run-clean, but they differ from the switch in colony, sex, age and lifelong exposure. Disagreement is informative, not disqualifying: the switch is acute and adult-onset.
+- **Liver-specific**: the brain effect is opposite in sign or less than half the liver effect.
+- **Not a replicate false positive**: the gene does not differ between the two runs of the same mouse.
+- **Not tracking library quality**: |r| < 0.6 with STAR uniquely-mapped % within the Cre mice.
+
+**Calibration.** The brain column of the table below is the same filter applied where the switch should do nothing. The ratio of brain to liver counts is a rough guide to how many liver candidates could be noise. Brain has one fewer batch-control GFP mouse (B13 excluded), which makes brain somewhat noisier.
+
+```{r effect-size-genes}
+apoe_sets <- APOE_LIVER_SETS |>
+  mutate(genes = map2(go, set, \(g, s) {
+    x <- go_members(g)
+    if (str_detect(s, "OXPHOS")) setdiff(x, mt_ids) else x
+  }))
+# one label per gene for the figures: its most specific (smallest) set; every membership is kept
+# in apoe_sets_all
+apoe_member <- apoe_sets |> mutate(n = lengths(genes)) |> dplyr::select(set, basis, n, genes) |>
+  unnest(genes) |> dplyr::rename(ensemblID = genes) |> arrange(n) |>
+  group_by(ensemblID) |> mutate(apoe_sets_all = paste(set, collapse = "; ")) |>
+  slice(1) |> ungroup() |> dplyr::select(-n)
+
+# dose-response per gene (summary in VALIDITY CHECKS): Cre mice only, ~ sex + E2 fraction
+dose_gene_res <- function(tissue) {
+  cm <- aav_meta(tissue) |> rownames_to_column("sample") |>
+    dplyr::filter(treatment == "Cre", run == CRE_RUN) |>
+    left_join(e2_by_mouse, by = "mouse_id") |> dplyr::filter(!is.na(e2_frac)) |>
+    column_to_rownames("sample") |> mutate(e2_frac_c = as.numeric(scale(e2_frac)))
+  DESeqDataSetFromMatrix(geneCounts[gene_qc[[tissue]]$keep, rownames(cm)], cm, ~ sex + e2_frac_c) |>
+    norm_dds() |> DESeq(quiet = TRUE) |> results(name = "e2_frac_c")
+}
+res_col <- function(r, ids, col) as.data.frame(r)[ids, col]
+
+# one row per gene: main effect + every line of evidence. `other` = the other tissue's main fit
+# (liver-specific check for liver; for brain it is the liver fit, shown for symmetry).
+es_table <- function(tissue) {
+  f     <- fits$fit[[match(tissue, fits$tissue)]]
+  other <- fits$fit[[match(setdiff(TISSUES, tissue), fits$tissue)]]$res
+  germ  <- germline$res[[which(germline$tissue == tissue & germline$a == "E2" & germline$b == "E4")]]
+  dose  <- dose_gene_res(tissue)
+  loo   <- map(f$loo, \(l) l$res$log2FoldChange) |> purrr::reduce(cbind)
+  if (is.null(dim(loo))) loo <- matrix(loo, ncol = 1)
+  libq  <- cand_genes_all |> dplyr::filter(tissue == !!tissue) |>
+    dplyr::select(ensemblID, r_with_lib_quality, replicate_fp)
+  as_tibble(as.data.frame(f$res), rownames = "ensemblID") |>
+    transmute(tissue = tissue, ensemblID, baseMean, log2FC = log2FoldChange, lfcSE, pvalue, padj,
+              ci_lo = log2FC - 1.96 * lfcSE, ci_hi = log2FC + 1.96 * lfcSE,
+              log2FC_shrunk = f$resLFC$log2FoldChange,
+              loo_same_sign = rowSums(sign(loo) == sign(log2FC)) == ncol(loo),
+              loo_min_abs_lfc = apply(abs(loo), 1, min),
+              run_offset_log2 = f$offset[ensemblID]) |>
+    mutate(log2FC_oct = res_col(f$within, ensemblID, "log2FoldChange"),
+           p_oct      = res_col(f$within, ensemblID, "pvalue"),
+           dose_lfc_per_sd = res_col(dose, ensemblID, "log2FoldChange"),
+           p_dose     = res_col(dose, ensemblID, "pvalue"),
+           log2FC_germline_E2vsE4 = res_col(germ, ensemblID, "log2FoldChange"),
+           p_germline = res_col(germ, ensemblID, "pvalue"),
+           log2FC_other_tissue = res_col(other, ensemblID, "log2FoldChange")) |>
+    left_join(libq, by = "ensemblID") |>
+    left_join(dplyr::select(id2name, ensemblID, Symbol), by = "ensemblID") |>
+    left_join(dplyr::select(apoe_member, ensemblID, apoe_set = set, apoe_basis = basis, apoe_sets_all), by = "ensemblID") |>
+    mutate(
+      # the criteria (what puts a gene on the list)
+      meets_effect = abs(log2FC) >= ES_LFC & baseMean >= ES_MIN_MEAN,
+      not_sig      = is.na(padj) | padj >= PADJ_CUT,
+      consistent   = sign(log2FC_oct) == sign(log2FC) & loo_same_sign,
+      candidate    = meets_effect & not_sig & (consistent | !ES_CONSISTENT),
+      # the evidence (reported, never used to drop a gene)
+      ev_nominal_main     = pvalue < 0.05,      # NA = Cook's outlier, no p value
+      ev_nominal_oct      = p_oct < 0.05,
+      ev_dose_same_sign   = sign(dose_lfc_per_sd) == sign(log2FC),
+      ev_dose_nominal     = ev_dose_same_sign & p_dose < 0.05,
+      ev_germline_E2_like = sign(log2FC_germline_E2vsE4) == sign(log2FC),
+      ev_germline_nominal = ev_germline_E2_like & p_germline < 0.05,
+      # liver-specific: the switch acts in hepatocytes; a gene that moves as much in brain looks
+      # like genetic background or a systemic / technical effect
+      ev_tissue_specific  = is.na(log2FC_other_tissue) | sign(log2FC_other_tissue) != sign(log2FC) |
+        abs(log2FC_other_tissue) < abs(log2FC) / 2,
+      ev_not_replicate_fp = !replicate_fp %in% TRUE,
+      ev_not_lib_quality  = is.na(r_with_lib_quality) | abs(r_with_lib_quality) < 0.6) |>
+    relocate(tissue, ensemblID, Symbol, apoe_set, apoe_basis)
+}
+es_by_tissue <- map(set_names(TISSUES), es_table)
+es_all <- es_by_tissue$Liver
+es_genes <- es_all |> dplyr::filter(candidate) |> arrange(pvalue)
+write_csv(bind_rows(es_by_tissue), file.path(CSV_DIR, "deseq2", "effect_size_all_genes.csv"))
+write_csv(bind_rows(es_by_tissue) |> dplyr::filter(candidate) |> arrange(tissue, pvalue),
+          file.path(CSV_DIR, "deseq2", "effect_size_candidates.csv"))
+
+# How the list is built, step by step. Brain is the negative control: the AAV-TBG switch acts in
+# hepatocytes, so the brain count is roughly what the same filter lets through without a switch.
+es_funnel <- imap(es_by_tissue, \(d, t) {
+  cand <- dplyr::filter(d, candidate)
+  tibble(tissue = t,
+         step = c("tested genes",
+                  sprintf("|log2FC| >= %.2f and baseMean >= %d", ES_LFC, ES_MIN_MEAN),
+                  sprintf("... and padj >= %.2f (not significant)", PADJ_CUT),
+                  "... and same sign in 2025-10-only and every leave-one-out",
+                  "... of which nominal p < 0.05 (main model)",
+                  "... of which in an APOE-liver set"),
+         n = c(sum(!is.na(d$pvalue)), sum(d$meets_effect, na.rm = TRUE),
+               sum(d$meets_effect & d$not_sig, na.rm = TRUE), nrow(cand),
+               sum(cand$ev_nominal_main, na.rm = TRUE), sum(!is.na(cand$apoe_set))))
+}) |> bind_rows() |> pivot_wider(names_from = tissue, values_from = n)
+write_csv(es_funnel, file.path(CSV_DIR, "deseq2", "effect_size_funnel.csv"))
+es_funnel
+```
+
+Candidates in an APOE-liver set (the full list, including genes outside every set, is in `csv/deseq2/effect_size_candidates.csv`):
+
+```{r effect-size-gene-table}
+es_genes |> dplyr::filter(!is.na(apoe_set)) |>
+  dplyr::select(apoe_basis, apoe_set, Symbol, baseMean, log2FC, ci_lo, ci_hi, pvalue, padj,
+                log2FC_oct, p_oct, dose_lfc_per_sd, p_dose, log2FC_germline_E2vsE4, log2FC_other_tissue,
+                starts_with("ev_")) |>
+  arrange(apoe_basis, apoe_set, pvalue) |> mutate(across(where(is.double), \(x) signif(x, 2)))
+```
+
+All other candidates (no APOE-liver set), by p value:
+
+```{r effect-size-other-table}
+es_genes |> dplyr::filter(is.na(apoe_set)) |>
+  dplyr::select(Symbol, baseMean, log2FC, pvalue, padj, log2FC_oct, log2FC_germline_E2vsE4,
+                log2FC_other_tissue, starts_with("ev_")) |>
+  mutate(across(where(is.double), \(x) signif(x, 2)))
+```
+
+## Pathways
+
+**Pathways.** Two complementary views:
+
+1. **APOE-liver sets.** GSEA of each set on the Wald statistic of every contrast that bears on the switch: main, 2025-10 only, within-Cre dose, germline E2 vs E4, and brain as the negative control. FDR is controlled within the small family (a priori / from this data), not across all of GO. Testing a few hypothesis-driven sets is the standard way to keep power, provided the sets are fixed before looking.
+2. **Genome-wide GO near-misses.** Terms with |NES| ≥ 1.5 and 0.05 ≤ FDR < 0.25 in the main liver GSEA, with leave-one-out and 2025-10-only direction. Subramanian et al. (2005) recommend FDR < 0.25 for exploratory GSEA.
+
+Caveat: preranked GSEA permutes genes, not samples. It ignores correlation between genes, so its p values are optimistic for sets of co-regulated genes (Wu & Smyth 2012). Agreement across contrasts is a better guide than any single p value.
+
+```{r effect-size-pathways}
+# 1. APOE-liver sets: GSEA on the Wald statistic (signed, scaled by uncertainty) of every contrast
+#    that bears on the switch, so each set is read against the same lines of evidence as a gene.
+#    FDR is controlled within each family (a priori / this data), not across all of GO: a small,
+#    pre-specified family is the standard way to keep power for hypothesis-driven sets.
+set_t2g <- apoe_sets |> dplyr::select(set, genes) |> unnest(genes) |> dplyr::rename(gene = genes)
+stat_rank <- function(r) {
+  s <- set_names(r$stat, rownames(r))
+  sort(s[!is.na(s)], decreasing = TRUE)
+}
+gsea_sets <- function(r, contrast) {
+  g <- clusterProfiler::GSEA(stat_rank(r), TERM2GENE = set_t2g, pvalueCutoff = 1, minGSSize = 5,
+                             maxGSSize = 2000, eps = 0, seed = TRUE, verbose = FALSE) |>
+    as.data.frame()
+  tibble(set = g$ID, NES = g$NES, pvalue = g$pvalue, setSize = g$setSize,
+         leading_edge = map_chr(str_split(g$core_enrichment, "/"),
+                                \(x) paste(na.omit(id2name$Symbol[match(x, id2name$ensemblID)]), collapse = "/")),
+         contrast = contrast)
+}
+liver_fit <- fits$fit[[match("Liver", fits$tissue)]]
+germ_liver <- germline$res[[which(germline$tissue == "Liver" & germline$a == "E2" & germline$b == "E4")]]
+SET_CONTRASTS <- c("Cre vs GFP (main)", "Cre vs GFP (2025-10 only)", "Dose: E2 fraction (Cre only)",
+                   "Germline E2 vs E4", "Brain Cre vs GFP (neg. control)")
+set_gsea <- list(liver_fit$res, liver_fit$within, dose_gene_res("Liver"), germ_liver,
+                 fits$fit[[match("Brain", fits$tissue)]]$res) |>
+  map2(SET_CONTRASTS, gsea_sets) |> bind_rows() |>
+  left_join(dplyr::select(APOE_LIVER_SETS, set, basis), by = "set") |>
+  group_by(contrast, basis) |> mutate(padj_family = p.adjust(pvalue, "BH")) |> ungroup()
+# leave-one-GFP-out for the main contrast: does the set keep its sign?
+set_loo <- imap(liver_fit$loo, \(l, k) gsea_sets(l$res, k)) |> bind_rows() |>
+  group_by(set) |> summarise(loo_min_abs_NES = min(abs(NES)), loo_signs = list(sign(NES)), .groups = "drop")
+set_tbl <- set_gsea |> dplyr::filter(contrast == SET_CONTRASTS[1]) |>
+  left_join(set_loo, by = "set") |>
+  mutate(loo_same_sign = map2_lgl(loo_signs, NES, \(s, n) all(s == sign(n)))) |>
+  dplyr::select(-loo_signs) |>
+  left_join(set_gsea |> dplyr::filter(contrast != SET_CONTRASTS[1]) |>
+              dplyr::select(set, contrast, NES) |>
+              pivot_wider(names_from = contrast, values_from = NES, names_prefix = "NES: "), by = "set")
+write_csv(set_tbl, file.path(CSV_DIR, "pathway", "apoe_liver_sets_main_with_checks.csv"))
+write_csv(set_gsea, file.path(CSV_DIR, "pathway", "apoe_liver_sets_gsea_all_contrasts.csv"))
+set_tbl |> dplyr::select(basis, set, setSize, NES, pvalue, padj_family, loo_same_sign) |>
+  mutate(across(where(is.numeric), \(x) signif(x, 2)))
+
+# 2. genome-wide GO near-misses: |NES| >= ES_NES and PADJ_CUT <= padj < ES_GSEA_FDR in the main
+#    liver GSEA (same ranking as PATHWAY ANALYSIS: shrunk log2FC), with leave-one-out and 2025-10-
+#    only direction. GSEA's authors recommend FDR < 0.25 for exploratory, hypothesis-generating use.
+near_miss <- map(c("BP", "MF", "CC"), \(o) {
+  main <- gsea_all(lfc_table(liver_fit$res, liver_fit$resLFC$log2FoldChange), o)
+  loo  <- imap(liver_fit$loo, \(l, k) gsea_all(lfc_table(l$res, l$lfc), o) |>
+                 transmute(ID, NES_loo = NES, dropped = k)) |> bind_rows()
+  w    <- gsea_all(lfc_table(liver_fit$within, liver_fit$within$log2FoldChange), o) |>
+    transmute(ID, NES_within = NES)
+  main |> dplyr::filter(abs(NES) >= ES_NES, p.adjust >= PADJ_CUT, p.adjust < ES_GSEA_FDR) |>
+    transmute(ont = o, ID, Description, setSize, NES, pvalue, p.adjust,
+              leading_edge = map_chr(str_split(core_enrichment, "/"), \(x)
+                paste(na.omit(suppressMessages(mapIds(org.Mm.eg.db, x, "SYMBOL", "ENTREZID"))), collapse = "/"))) |>
+    left_join(loo |> group_by(ID) |> summarise(n_loo = n(), loo_same_sign_n = list(sign(NES_loo)),
+                                               .groups = "drop"), by = "ID") |>
+    left_join(w, by = "ID") |>
+    mutate(loo_same_sign = map2_lgl(loo_same_sign_n, NES, \(s, n) length(s) == length(liver_fit$loo) &&
+                                      all(s == sign(n))),
+           within_same_sign = sign(NES_within) == sign(NES)) |>
+    dplyr::select(-loo_same_sign_n)
+}) |> bind_rows() |> arrange(p.adjust)
+write_csv(near_miss, file.path(CSV_DIR, "pathway", "liver_gseGO_near_miss.csv"))
+near_miss |> dplyr::count(ont, loo_same_sign, within_same_sign)
+```
+
+GO near-misses (all three ontologies):
+
+```{r effect-size-near-miss-table}
+near_miss |> dplyr::select(ont, Description, setSize, NES, pvalue, p.adjust, loo_same_sign,
+                           within_same_sign, leading_edge) |>
+  mutate(across(where(is.double), \(x) signif(x, 2)))
+```
+
+## Gene figures
+
+**Figures.** On each gene row:
+
+- black dot: main-model log2FC, with its 95% CI;
+- pink ring: 2025-10 only;
+- blue triangle: germline E2 vs E4;
+- grey cross: brain;
+- dashed lines: the ±1.5-fold threshold;
+- `*`: a gene in a set chosen from this data.
+
+The tiles on the right are the evidence columns.
+
+```{r effect-size-gene-figure}
+EV_COLS <- c(ev_nominal_main = "p < 0.05, main model", ev_nominal_oct = "p < 0.05, 2025-10 only",
+             ev_dose_same_sign = "Dose: same sign", ev_dose_nominal = "Dose: p < 0.05",
+             ev_germline_E2_like = "Germline E2 vs E4: same sign", ev_germline_nominal = "Germline: p < 0.05",
+             ev_tissue_specific = "Liver-specific (brain < half)", ev_not_replicate_fp = "Not a replicate FP",
+             ev_not_lib_quality = "Not tracking library quality")
+fig_genes <- function(d, show_other = TRUE,
+                      other_label = sprintf("Other (top %d by p)", ES_SHOW_OTHER)) {
+  show <- bind_rows(dplyr::filter(d, !is.na(apoe_set)),
+                    if (show_other) d |> dplyr::filter(is.na(apoe_set)) |>
+                      slice_min(pvalue, n = ES_SHOW_OTHER, with_ties = FALSE)) |>
+    mutate(group = factor(replace_na(apoe_set, other_label), levels = c(APOE_LIVER_SETS$set, other_label)) |>
+             droplevels(),
+           gene = fct_reorder(paste0(Symbol, ifelse(apoe_basis %in% "this data", "*", "")), log2FC))
+  pts <- show |> dplyr::select(group, gene, `Cre vs GFP (main)` = log2FC, `2025-10 only` = log2FC_oct,
+                               `Germline E2 vs E4` = log2FC_germline_E2vsE4, Brain = log2FC_other_tissue) |>
+    pivot_longer(-c(group, gene), names_to = "estimate", values_to = "lfc") |>
+    mutate(estimate = factor(estimate, levels = c("Cre vs GFP (main)", "2025-10 only", "Germline E2 vs E4", "Brain")))
+  lim <- 3
+  forest <- ggplot(show, aes(y = gene)) +
+    geom_vline(xintercept = 0, linewidth = 0.25) +
+    geom_vline(xintercept = c(-1, 1) * ES_LFC, linewidth = 0.2, linetype = 2, colour = "grey50") +
+    geom_errorbar(aes(xmin = pmax(ci_lo, -lim), xmax = pmin(ci_hi, lim)), width = 0, linewidth = 0.3,
+                  orientation = "y") +
+    geom_point(data = pts, aes(x = pmax(pmin(lfc, lim), -lim), shape = estimate, colour = estimate),
+               size = 1, stroke = 0.4) +
+    scale_shape_manual(values = c(16, 1, 17, 4), name = NULL) +
+    scale_colour_manual(values = c("black", GROUP_COLS[["Cre"]], "#2166AC", "grey55"), name = NULL) +
+    facet_grid(group ~ ., scales = "free_y", space = "free_y", switch = "y",
+               labeller = label_wrap_gen(20)) +
+    scale_x_continuous(limits = c(-lim, lim), oob = scales::squish) +
+    labs(x = "log2 fold change (bar: main-model 95% CI)", y = NULL) +
+    theme_bulk(6.5) +
+    theme(strip.placement = "outside", strip.text.y.left = element_text(angle = 0, hjust = 1, size = 6),
+          legend.position = "top", panel.spacing = unit(0.6, "mm"),
+          axis.text.y = element_text(size = 6, face = "italic"))
+  tiles <- show |> dplyr::select(group, gene, all_of(names(EV_COLS))) |>
+    pivot_longer(all_of(names(EV_COLS)), names_to = "check", values_to = "pass") |>
+    mutate(check = factor(EV_COLS[check], levels = EV_COLS),
+           pass = factor(case_when(is.na(pass) ~ "n/a", pass ~ "yes", TRUE ~ "no"), levels = c("yes", "no", "n/a")))
+  evid <- ggplot(tiles, aes(check, gene, fill = pass)) +
+    geom_tile(colour = "white", linewidth = 0.3) +
+    facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+    scale_fill_manual(values = c(yes = "grey20", no = "grey92", `n/a` = "white"), name = NULL) +
+    scale_x_discrete(position = "top") +
+    labs(x = NULL, y = NULL) +
+    theme_bulk(6.5) +
+    theme(axis.text.y = element_blank(), axis.ticks = element_blank(), axis.line = element_blank(),
+          strip.text = element_blank(), panel.spacing = unit(0.6, "mm"),
+          axis.text.x.top = element_text(size = 6, angle = 90, hjust = 0, vjust = 0.5),
+          legend.position = "top")
+  list(plot = forest + evid + plot_layout(widths = c(1.25, 1)), n = nrow(show),
+       n_groups = n_distinct(show$group))
+}
+# two pages so each stays readable at print size: (1) a priori APOE-liver sets, (2) sets chosen from
+# this data + the top candidates outside every set
+gene_pages <- list(a_priori  = dplyr::filter(es_genes, apoe_basis %in% "a priori"),
+                   this_data = dplyr::filter(es_genes, !apoe_basis %in% "a priori"))
+gene_figs <- imap(gene_pages, \(d, nm) {
+  fg <- fig_genes(d, show_other = nm == "this_data")
+  h  <- min(240, 30 + 2.6 * fg$n + 1.5 * fg$n_groups)
+  save_plot(fg$plot, file.path(FIG_DIR, "deseq2", paste0("effect_size_genes_liver_", nm)), "full", h)
+  list(plot = fg$plot, height_in = h / 25.4)
+})
+```
+
+### A priori APOE-liver sets
+
+```{r}
+#| echo: false
+#| fig-width: !expr 174 / 25.4
+#| fig-height: !expr gene_figs$a_priori$height_in
+gene_figs$a_priori$plot
+```
+
+### Sets chosen from this data, and the top candidates outside every set
+
+```{r}
+#| echo: false
+#| fig-width: !expr 174 / 25.4
+#| fig-height: !expr gene_figs$this_data$height_in
+gene_figs$this_data$plot
+```
+
+## Pathway figure
+
+
+
+```{r effect-size-pathway-figure}
+dot <- set_gsea |>
+  mutate(contrast = factor(contrast, levels = SET_CONTRASTS),
+         set = factor(set, levels = rev(APOE_LIVER_SETS$set)),
+         basis = factor(basis, levels = c("a priori", "this data"),
+                        labels = c("A priori", "From this data")),
+         ring = factor(case_when(padj_family < PADJ_CUT ~ sprintf("FDR < %.2f", PADJ_CUT),
+                                 padj_family < ES_GSEA_FDR ~ sprintf("FDR < %.2f", ES_GSEA_FDR),
+                                 TRUE ~ "n.s."),
+                       levels = c(sprintf("FDR < %.2f", PADJ_CUT), sprintf("FDR < %.2f", ES_GSEA_FDR), "n.s.")))
+p_sets <- ggplot(dot, aes(contrast, set)) +
+  geom_point(aes(fill = NES, size = -log10(pvalue), colour = ring), shape = 21, stroke = 0.5) +
+  facet_grid(basis ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-2.5, 2.5),
+                       oob = scales::squish) +
+  scale_colour_manual(values = c("black", "grey45", "grey85"), name = "Family FDR", drop = FALSE) +
+  scale_size_area(max_size = 4, name = "-log10 p") +
+  scale_x_discrete(labels = label_wrap_gen(14)) +
+  labs(x = NULL, y = NULL) +
+  theme_bulk(6.5) + theme(axis.text.x = element_text(size = 6), strip.text.y = element_text(size = 6, angle = 270, face = "bold"))
+
+nm_show <- near_miss |> dplyr::filter(ont == "BP") |> slice_min(p.adjust, n = 30, with_ties = FALSE) |>
+  mutate(term = fct_reorder(str_trunc(Description, 55), NES),
+         check = case_when(loo_same_sign & within_same_sign ~ "LOO + 2025-10 same sign",
+                           loo_same_sign | within_same_sign ~ "one of the two",
+                           TRUE ~ "neither"))
+p_nm <- ggplot(nm_show, aes(NES, term)) +
+  geom_vline(xintercept = 0, linewidth = 0.25) +
+  geom_segment(aes(x = 0, xend = NES, yend = term), linewidth = 0.3, colour = "grey60") +
+  geom_point(aes(size = setSize, fill = check), shape = 21, stroke = 0.3) +
+  scale_fill_manual(values = c(`LOO + 2025-10 same sign` = "grey15", `one of the two` = "grey60",
+                               neither = "white"), name = NULL) +
+  scale_size_area(max_size = 3, name = "Genes") +
+  labs(x = sprintf("NES (GO BP, %.2f <= FDR < %.2f)", PADJ_CUT, ES_GSEA_FDR), y = NULL) +
+  theme_bulk(6.5) + theme(axis.text.y = element_text(size = 6), legend.position = "bottom")
+p_path <- (p_sets / p_nm) + plot_layout(heights = c(1, 1.5)) + plot_annotation(tag_levels = "a") &
+  theme(plot.tag = element_text(size = 8, face = "bold"))
+save_plot(p_path, file.path(FIG_DIR, "pathway", "effect_size_pathways_liver"), "full", 225)
+```
+
+(a) APOE-liver sets across contrasts: fill = NES; size = −log10 p; ring = family FDR. (b) The 30 GO BP near-misses with the lowest FDR (all terms are in the table above). Fill shows whether the term keeps its sign in every leave-one-out refit and in the 2025-10-only test.
+
+```{r}
+#| echo: false
+#| fig-width: !expr 174 / 25.4
+#| fig-height: !expr 225 / 25.4
+p_path
+```
+
+## Your selection for the write-up
+
+Empty by default: nothing is chosen for you. List the genes (symbols) and APOE-liver sets you decide to report. This chunk then draws the write-up figure from the same estimates and evidence: `figures/deseq2/effect_size_selected.pdf` / `.png`.
+
+```{r effect-size-selected}
+ES_SELECTED_GENES <- character()   # e.g. c("Ass1", "Asl")
+ES_SELECTED_SETS  <- character()   # e.g. "Urea cycle"
+if (length(ES_SELECTED_GENES)) {
+  sel <- es_all |> dplyr::filter(Symbol %in% ES_SELECTED_GENES)
+  fs  <- fig_genes(sel, show_other = FALSE, other_label = "Not in an APOE-liver set")
+  save_plot(fs$plot, file.path(FIG_DIR, "deseq2", "effect_size_selected"), "full",
+            min(240, 30 + 2.6 * fs$n + 1.5 * fs$n_groups))
+  fs$plot
+} else message("No genes selected yet: set ES_SELECTED_GENES.")
+if (length(ES_SELECTED_SETS)) dplyr::filter(set_gsea, set %in% ES_SELECTED_SETS) |>
+  dplyr::select(set, contrast, NES, pvalue, padj_family, leading_edge)
+```
+
+```{r}
+#| include: false
+ckpt_save("06")
+```

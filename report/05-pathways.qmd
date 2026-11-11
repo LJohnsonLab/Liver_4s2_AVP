@@ -1,0 +1,234 @@
+# Cre vs GFP: pathway analysis
+
+GO gene set enrichment on the main model, its leave-one-out robustness, and over-representation analysis.
+
+```{r}
+#| include: false
+source("_common.R")   # chapters render from report/
+ckpt_load("04")
+```
+
+## Gene set enrichment (GO)
+
+Following the tutorial: Ensembl → Entrez with `mapIds(multiVals = "first")`, retrying unmapped genes by symbol, dropping duplicate Entrez IDs, and ranking genes by log2 fold change for `gseGO`. Two deliberate changes from the tutorial code:
+
+- the GSEA ranking uses **every tested gene** (the tutorial ranks only the significant genes, which leaves GSEA nothing to compare against), ranked by the **apeglm-shrunken** log2FC so noisy low-count genes don't dominate the extremes;
+- custom contigs (hAPOE, transgenes) are removed, as the tutorial removes ERCC spike-ins.
+
+```{r pathway-ids}
+# Clear this section's previous outputs so a result that is empty this run cannot leave an
+# older file behind (these folders hold only files written by the pathway chunks).
+walk(file.path(c(CSV_DIR, FIG_DIR), "pathway"),
+     \(d) unlink(list.files(d, full.names = TRUE)))
+
+map_entrez <- function(de) {
+  d <- de |>
+    dplyr::filter(!is.na(padj), str_starts(ensemblID, "ENSMUSG")) |>
+    mutate(entrez = mapIds(org.Mm.eg.db, keys = ensemblID, column = "ENTREZID",
+                           keytype = "ENSEMBL", multiVals = "first"))
+  miss <- is.na(d$entrez) & !is.na(d$Symbol) & d$Symbol %in% keys(org.Mm.eg.db, "SYMBOL")
+  if (any(miss))
+    d$entrez[miss] <- mapIds(org.Mm.eg.db, keys = d$Symbol[miss], column = "ENTREZID",
+                             keytype = "SYMBOL", multiVals = "first")
+  d |> dplyr::filter(!is.na(entrez)) |> dplyr::distinct(entrez, .keep_all = TRUE)
+}
+
+ranked_genes <- function(d) sort(set_names(d$log2FoldChange_shrunk, d$entrez), decreasing = TRUE)
+
+paths <- fits |>
+  transmute(tissue, mapped = map(de, map_entrez), ranked = map(mapped, ranked_genes))
+paths |> transmute(tissue, n_mapped = map_int(mapped, nrow))
+```
+
+```{r pathway-gsea}
+# gseGO for each GO ontology (tutorial ran CC; BP and MF added)
+run_gsego <- function(ranked, ont)
+  gseGO(geneList = ranked, OrgDb = org.Mm.eg.db, ont = ont, keyType = "ENTREZID",
+        minGSSize = 15, maxGSSize = 500, pvalueCutoff = PADJ_CUT, eps = 0,
+        seed = TRUE, verbose = FALSE) |>
+  setReadable(OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+
+gsea <- expand_grid(tissue = TISSUES, ont = c("BP", "MF", "CC")) |>
+  left_join(dplyr::select(paths, tissue, ranked), by = "tissue") |>
+  mutate(res = map2(ranked, ont, run_gsego),
+         n_sig = map_int(res, \(r) nrow(as.data.frame(r))))
+saveRDS(dplyr::select(gsea, -ranked), file.path(OBJ_DIR, "gseGO_cre_vs_gfp.rds"))
+dplyr::select(gsea, tissue, ont, n_sig)
+
+gsea |>
+  dplyr::filter(n_sig > 0) |>
+  pwalk(\(tissue, ont, ranked, res, n_sig)
+        write_tsv(as.data.frame(res),
+                  file.path(CSV_DIR, "pathway", sprintf("%s_gseGO_%s.tsv", tolower(tissue), ont))))
+```
+
+## Leave-one-out robustness of GO terms
+
+```{r pathway-gsea-loo}
+# Robustness of each primary GSEA term:
+#  - leave-one-out: GSEA rerun on the primary model refit without each 2025-10 GFP mouse
+#    (fits$fit[[.]]$loo); must stay significant, same NES sign;
+#  - within-run direction: GSEA on the 2025-10-only Cre vs GFP fold changes; NES must have the
+#    same sign (direction only; that comparison has 3 GFP).
+# gseGO is run with every term returned (pvalueCutoff = 1) so missing terms are real misses.
+gsea_all <- function(lfc_tbl, ont)
+  gseGO(geneList = ranked_genes(map_entrez(lfc_tbl)), OrgDb = org.Mm.eg.db, ont = ont,
+        keyType = "ENTREZID", minGSSize = 15, maxGSSize = 500, pvalueCutoff = 1, eps = 0,
+        seed = TRUE, verbose = FALSE) |>
+  as.data.frame()
+
+lfc_table <- function(res, lfc)
+  as_tibble(as.data.frame(res), rownames = "ensemblID") |>
+  mutate(log2FoldChange_shrunk = lfc) |>
+  left_join(dplyr::select(id2name, ensemblID, Symbol), by = "ensemblID")
+
+fit_of <- set_names(fits$fit, fits$tissue)
+
+gsea_loo <- gsea |>
+  dplyr::filter(n_sig > 0) |>
+  dplyr::select(tissue, ont, res) |>
+  mutate(loo = map2(tissue, ont, \(t, o)
+           imap(fit_of[[t]]$loo, \(l, b) gsea_all(lfc_table(l$res, l$lfc), o) |>
+                  transmute(ID, NES_loo = NES, padj_loo = p.adjust, dropped = b)) |>
+             bind_rows() |> (\(x) if (nrow(x)) x else
+               tibble(ID = character(), NES_loo = double(), padj_loo = double(), dropped = character()))()),
+         within = map2(tissue, ont, \(t, o) {
+           w <- fit_of[[t]]$within
+           gsea_all(lfc_table(w, w$log2FoldChange), o) |> transmute(ID, NES_within = NES)
+         }),
+  robust = pmap(list(res, loo, within), \(r, l, w) {
+    n_fits <- n_distinct(l$dropped)
+    as.data.frame(r) |>
+      dplyr::select(ID, Description, NES, p.adjust) |>
+      left_join(l, by = "ID") |>
+      group_by(ID, Description, NES, p.adjust) |>
+      summarise(n_loo = sum(!is.na(padj_loo)),
+                loo_max_padj = suppressWarnings(max(padj_loo, na.rm = TRUE)),
+                loo_same_sign = all(sign(NES_loo) == sign(NES[1]), na.rm = TRUE),
+                drivers = paste(dropped[!is.na(dropped) & (is.na(padj_loo) | padj_loo >= PADJ_CUT |
+                                          sign(NES_loo) != sign(NES[1]))], collapse = ";"),
+                .groups = "drop") |>
+      left_join(w, by = "ID") |>
+      mutate(within_same_sign = sign(NES_within) == sign(NES),
+             loo_ok = n_fits == 0 |
+               (n_loo == n_fits & loo_same_sign & loo_max_padj < PADJ_CUT),
+             robust = loo_ok & within_same_sign %in% TRUE) |>
+      arrange(desc(robust), p.adjust)
+  }))
+
+pwalk(dplyr::select(gsea_loo, tissue, ont, robust), \(tissue, ont, robust)
+      write_tsv(robust, file.path(CSV_DIR, "pathway",
+                                  sprintf("%s_gseGO_%s_loo_robustness.tsv", tolower(tissue), ont))))
+gsea_loo |> transmute(tissue, ont, n_terms = map_int(robust, nrow),
+                      n_robust = map_int(robust, \(r) sum(r$robust)))
+```
+
+## GSEA figures
+
+```{r pathway-gsea-plots, fig.width = 6.7, fig.height = 5}
+# Tutorial plots: dotplot, ridgeplot, cnetplot, gseaplot of the top term
+gsea_figs <- function(tissue, ont, ranked, res, n_sig) {
+  stem <- file.path(FIG_DIR, "pathway", sprintf("%s_gseGO_%s", tolower(tissue), ont))
+  ttl  <- sprintf("%s · GO %s", tissue, ont)
+  dot <- dotplot(res, showCategory = 15, split = ".sign", font.size = 6, label_format = 45) +
+    facet_grid(~ .sign) + labs(title = ttl) + theme_bulk() +
+    theme(axis.text.y = element_text(size = 6))
+  ridge <- ridgeplot(res, showCategory = 15, label_format = 45) +
+    labs(title = ttl, x = "Shrunken log2FC") + theme_bulk() +
+    theme(axis.text.y = element_text(size = 6))
+  cnet <- cnetplot(res, foldChange = ranked, showCategory = 5) +
+    labs(title = ttl) +
+    theme(text = element_text(size = 6, family = FONT),
+          legend.text = element_text(size = 6), legend.title = element_text(size = 7),
+          plot.title = element_text(size = 7, face = "bold"))
+  # gseaplot2 draws tick labels at 0.8 x base_size; 8 keeps them >= 6 pt
+  curve <- gseaplot2(res, geneSetID = 1, title = res$Description[1], base_size = 8,
+                     subplots = 1:2, rel_heights = c(1.5, 0.4))
+  save_plot(dot,   paste0(stem, "_dotplot"),   "full", 110)
+  save_plot(ridge, paste0(stem, "_ridgeplot"), "onehalf", 110)
+  save_plot(cnet,  paste0(stem, "_cnetplot"),  "full", 130)
+  save_plot(curve, paste0(stem, "_top_term_gseaplot"), "onehalf", 80)
+  # enrichment curves for the candidate pathways that are significant here (e.g. OXPHOS)
+  cand_ids <- intersect(unname(CANDIDATE_TERMS), res$ID)
+  if (length(cand_ids)) {
+    cc <- gseaplot2(res, geneSetID = cand_ids, base_size = 8, subplots = 1:2,
+                    rel_heights = c(1.5, 0.4), title = sprintf("%s · candidate pathways", tissue))
+    save_plot(cc, paste0(stem, "_candidate_gseaplot"), "onehalf", 90)
+  }
+  list(dot = dot, ridge = ridge)
+}
+
+# figures show every significant term (padj < PADJ_CUT); the leave-one-out robustness of each
+# term is in csv/pathway/*_loo_robustness.tsv
+gsea_plots <- gsea |>
+  dplyr::filter(n_sig > 0) |>
+  dplyr::select(tissue, ont, res, n_sig) |>
+  left_join(dplyr::select(paths, tissue, ranked), by = "tissue") |>
+  dplyr::select(tissue, ont, ranked, res, n_sig) |>
+  pmap(gsea_figs)
+walk(gsea_plots, \(x) print(x$dot))
+```
+
+## Over-representation analysis
+
+```{r pathway-ora}
+# ORA of the significant genes: GO BP (enrichGO) and KEGG (enrichKEGG, as in the tutorial),
+# split by direction, universe = every tested gene with an Entrez ID.
+run_ora <- function(mapped) {
+  sig  <- dplyr::filter(mapped, padj < PADJ_CUT)
+  sets <- split(sig$entrez, if_else(sig$log2FoldChange > 0, "Up in Cre", "Down in Cre"))
+  if (length(sets) == 0) return(list(go = NULL, kegg = NULL))
+  go <- compareCluster(sets, fun = "enrichGO", OrgDb = org.Mm.eg.db, keyType = "ENTREZID",
+                       ont = "BP", universe = mapped$entrez, pvalueCutoff = PADJ_CUT,
+                       qvalueCutoff = 1,     # padj < PADJ_CUT is the only significance rule
+                       readable = TRUE)
+  # KEGG is queried live from kegg.jp; skipped (NULL) if offline
+  kegg <- tryCatch(compareCluster(sets, fun = "enrichKEGG", organism = "mmu",
+                                  universe = mapped$entrez, pvalueCutoff = PADJ_CUT,
+                                  qvalueCutoff = 1),
+                   error = \(e) { message("KEGG unavailable: ", conditionMessage(e)); NULL })
+  list(go = go, kegg = kegg)
+}
+
+ora <- paths |> transmute(tissue, ora = map(mapped, run_ora))
+saveRDS(ora, file.path(OBJ_DIR, "ora_cre_vs_gfp.rds"))
+
+ora_out <- ora |>
+  mutate(go = map(ora, "go"), kegg = map(ora, "kegg")) |>
+  dplyr::select(-ora) |>
+  pivot_longer(c(go, kegg), names_to = "db", values_to = "res") |>
+  dplyr::filter(!map_lgl(res, \(r) is.null(r) || nrow(as.data.frame(r)) == 0))
+
+pwalk(ora_out, \(tissue, db, res) {
+  stem <- file.path(sprintf("%s_ORA_%s", tolower(tissue), db))
+  write_tsv(as.data.frame(res), file.path(CSV_DIR, "pathway", paste0(stem, ".tsv")))
+  p <- dotplot(res, showCategory = 10, font.size = 6, label_format = 45) +
+    labs(title = sprintf("%s · %s", tissue, toupper(db)), x = NULL) + theme_bulk() +
+    theme(axis.text.y = element_text(size = 6))
+  save_plot(p, file.path(FIG_DIR, "pathway", paste0(stem, "_dotplot")), "onehalf", 110)
+  print(p)
+})
+```
+
+```{r pathway-pathview, eval = FALSE}
+# Tutorial pathview diagram for the top KEGG pathway per tissue (downloads KEGG maps; writes
+# PNGs to the working directory, so run it from figures/pathway).
+library(pathview)
+old <- setwd(file.path(FIG_DIR, "pathway"))
+ora_out |>
+  dplyr::filter(db == "kegg") |>
+  pwalk(\(tissue, db, res) {
+    id <- as.data.frame(res)$ID[1]
+    pathview(gene.data = paths$ranked[[match(tissue, paths$tissue)]], pathway.id = id,
+             species = "mmu", limit = list(gene = c(-2, 2)),
+             low = "blue", mid = "white", high = "red",
+             out.suffix = paste0(tolower(tissue), "_cre_vs_gfp"))
+  })
+setwd(old)
+```
+
+
+```{r}
+#| include: false
+ckpt_save("05")
+```

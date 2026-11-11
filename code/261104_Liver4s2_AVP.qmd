@@ -1,0 +1,2051 @@
+---
+title: "Liver Switch BulkSeq Analysis"
+author: Akhil Pallerla
+format: html
+---
+
+Bulk RNA-seq of liver (A1–A22) and brain (B1–B22) from the EFAD follow-up cohort (Novogene X202SC25088042), processed on MCC following the Griffith lab RNA-seq course (rnabio.org): fastp adapter trim → HISAT2 → htseq-count / StringTie → DESeq2 → clusterProfiler, with gene counts for the analysis taken from STAR 2.7.11b (GeneCounts) on the same trimmed reads; HISAT2 + htseq-count is kept as an internal comparison. Reference: GRCm39 (Ensembl 116) with mouse *Apoe* masked and contigs added for human *APOE* (`hAPOE`, GRCh38 E3 locus), Cre, EGFP and the 5xFAD human APP / PSEN1 transgenes; the AAV's iCre (AY056050) is counted from unaligned reads. Processing scripts: `mcc_pipeline/scripts/` (run from `/pscratch/lajo247_uksr/efad_bulkseq/scripts` on MCC).
+
+Primary comparison: **Cre-AAV vs GFP-AAV**, run separately in liver and brain. Two Novogene runs are combined, both processed here from raw FASTQ with the same pipeline:
+
+- **2025-10** (X202SC25088042): 10 Cre + 3 GFP mice per tissue (+ 12-month EFAD controls, not used in this comparison), RNA extraction batches 1 and 2.
+- **2025-04** (X202SC25043333, samples prefixed `R1_`): the 10 GFP mice per tissue only. The 2025-04 Cre samples are excluded: they were different mice that were misgenotyped. Extraction batch `R1`.
+
+**Design.** Cre vs GFP in one DESeq2 model over 2025-10 Cre, 2025-10 GFP and 2025-04 GFP, with a batch term that fully removes the sequencing-run difference (and the 2025-10 extraction batch where estimable). The 2025-04 GFP add replication to the variance estimates; the fold change itself rests on the 2025-10 GFP mice, the batch control. Checks: (1) each 2025-10 GFP mouse is left out of a run-offset estimate and compared with the corrected 2025-04 GFP, (2) the same comparison without the 2025-04 samples, and (3) the model refit without each 2025-10 GFP mouse. GFP mice SAD_326 and MAD_271 were sequenced in both runs (bridge replicates; see BRIDGE CHECK). Brain B13 is excluded: it is not SAD_326 (APOE genotype mismatch).
+
+```{r setup}
+# Running chunks interactively starts R in the editor's workspace folder (e.g. ARIA_1_5), from
+# which here() cannot find this project. Move to the project root first; rendering already
+# runs from code/, where here() finds the .here file one level up.
+if (!file.exists(".here") && !file.exists(file.path("..", ".here"))) {
+  setwd("~/Documents/Liver4s2_BulkSeq")
+}
+here::i_am("code/261104_Liver4s2_AVP.qmd")          # project root = Liver4s2_BulkSeq/
+if (interactive()) setwd(here::here())              # root.dir below only applies when knitting
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+suppressPackageStartupMessages({
+  library(cqn)        # GC/length normalisation; first, so purrr::map masks mclust::map
+  library(tidyverse)
+  library(purrr)
+  library(data.table)
+  library(DESeq2)
+  library(apeglm)
+  library(AnnotationDbi)
+  library(org.Mm.eg.db)
+  library(clusterProfiler)
+  library(enrichplot)
+  library(ggnewscale)
+  library(pheatmap)
+  library(ggrepel)
+  library(patchwork)
+})
+set.seed(20261105)
+```
+
+###PARAMETERS###
+
+```{r params}
+## ---- paths (relative to the project root, Liver4s2_BulkSeq/) ------------------------
+IN_DIR  <- "objects"                                      # metadata + matrices pulled from MCC
+OBJ_DIR <- file.path("objects", "deseq2")
+CSV_DIR <- "csv"
+FIG_DIR <- "figures"
+walk(c(OBJ_DIR, file.path(CSV_DIR, c("qc", "deseq2", "pathway")),
+       file.path(FIG_DIR, c("qc", "deseq2", "pathway"))),
+     dir.create, recursive = TRUE, showWarnings = FALSE)
+
+## ---- analysis settings -----------------------------------------------------------------
+TISSUES    <- c("Liver", "Brain")
+# Gene counts used for every analysis: "STAR" (STAR --quantMode GeneCounts, unstranded column)
+# or "HISAT2" (HISAT2 + htseq-count intersection-strict, the tutorial route). The other one is
+# kept as the internal comparison in ALIGNER COMPARISON.
+COUNT_SOURCE <- "STAR"
+# Normalisation for every DESeq2 fit: "cqn" = conditional quantile normalisation of gene GC
+# content and length (Hansen et al. 2012) as DESeq2 normalisation factors; "deseq2" = median-of-
+# ratios size factors. cqn was chosen from the BATCH-CORRECTION BENCHMARK: it halved the
+# same-mouse difference between runs without using the double-run mice and kept agreement with
+# the unconfounded 2025-10-only comparison.
+NORMALIZATION <- "cqn"
+COUNT_FILES  <- c(STAR = "star_gene_counts.tsv", HISAT2 = "gene_read_counts_table_all_final.tsv")
+PADJ_CUT   <- 0.05          # the ONE significance cut-off: every DE, GSEA, ORA and check uses padj < 0.05
+
+## ---- sample QC --------------------------------------------------------------------------
+# Absolute cut-offs; a sample is also flagged if it is > QC_MAD MADs worse than its tissue's
+# median (below for QC_MIN metrics, above for QC_MAX metrics).
+QC_MIN <- c(raw_read_pairs = 20e6, hisat2_overall_alignment_pct = 80,
+            hisat2_concordant_unique_pct = 70, pct_assigned_to_genes = 50,
+            htseq_assigned = 10e6, detected_genes = 10000, rin = 6)
+QC_MAX <- c(pct_mito = 30, pct_rrna = 5, pct_top20 = 40)
+QC_MAD <- 3
+# Samples removed from every downstream step. Flags never drop anything automatically:
+# review the QC plots, then list sample IDs here with the reason.
+QC_EXCLUDE <- c(B13 = paste("sample identity: listed as SAD_326 but reads APOE E2/E2; SAD_326's",
+                            "2025-04 brain (R1_B1) and both livers read E4/E4"))
+
+## ---- gene QC ----------------------------------------------------------------------------
+# "strict": technical biotypes removed + CPM filter in >= smallest-group samples (default)
+# "tutorial": rnabio.org filter only (>= 10 reads in >= 1 sample)
+GENE_FILTER   <- "strict"
+MIN_COUNT     <- 10          # reads; also sets the CPM cut-off (MIN_COUNT / median library size)
+MIN_TOTAL     <- 15          # minimum summed count across the tissue's samples
+DROP_BIOTYPES <- c("rRNA", "rRNA_pseudogene", "Mt_rRNA", "Mt_tRNA", "misc_RNA",
+                   "scaRNA", "snoRNA", "snRNA", "ribozyme", "TEC")
+# Predicted / unnamed mouse genes, by symbol: Gm#####, ...Rik, LOC#####, cDNA-clone names
+# (BC######, AI######, ...). Genes with no symbol (symbol = Ensembl ID) are dropped too.
+DROP_PREDICTED <- "^Gm\\d+$|Rik\\d*$|^LOC\\d+$|^(AA|AB|AC|AF|AI|AU|AV|AW|AY|BC)\\d{5,6}$"
+# Cytosolic ribosomal proteins (Rpl#, Rps#, Rplp#, Rpsa and their -ps pseudogenes). Written so
+# it does NOT catch Rps6ka*/Rps6kb* kinases or the mitochondrial Mrpl/Mrps genes.
+DROP_RIBO      <- "^Rp[ls]\\d+[a-z]?\\d*(-ps\\d+)?$|^Rp[ls]\\d+(al|rt)$|^Rplp\\d|^Rpsa"
+## ---- comparison design ------------------------------------------------------------------
+# PRIMARY (one sample per mouse; see aav_meta): 2025-10 Cre vs GFP, with the 2025-04 GFP mice
+# that were not re-sequenced added as extra controls and the run
+# difference FULLY corrected: one DESeq2 GLM over all three sample sets with a batch term
+# (~ sex + batch + treatment; batch = extraction batch where every 2025-10 batch holds a GFP
+# mouse, else sequencing run -- see design_for()). The batch term removes the run difference and
+# carries its uncertainty; the 2025-04 GFP add replication to the dispersion estimates, while the
+# Cre-vs-GFP fold change rests on the 2025-10 GFP mice. Rejected alternatives:
+#  * apeglm-shrunk run offset from the bridge mice: ~80% of its DEGs followed the raw run
+#    difference and the brain showed >2,000 DEGs plus a hAPOE drop (run effects leaking);
+#  * a fixed unshrunk offset from all GFP as normalization factors: treats the run correction as
+#    known exactly, so its p-values were far too small (2,966 liver DEGs vs 18 within run).
+CRE_RUN    <- "2025-10"
+GFP_RUN    <- "2025-04"
+COEF       <- "treatment_Cre_vs_GFP"
+# CHECKS, using the GFP mice sequenced in 2025-10 (3 liver; 2 brain after excluding B13):
+#  1. out-of-sample correction check: each 2025-10 GFP mouse in turn is left out of the offset
+#     estimate, then compared with the corrected 2025-04 GFP. Few DE genes = the correction
+#     generalises to a mouse it did not see. The uncorrected run DE count is shown for scale.
+#  2. within-run check: 2025-10 Cre vs 2025-10 GFP only (no 2025-04 samples); used for
+#     direction.
+#  3. leave-one-out: the primary model refit without each 2025-10 GFP mouse, so no result
+#     hinges on one batch-control animal.
+# A primary DEG / GSEA term is flagged "robust" if it stays significant in every leave-one-out
+# and its direction agrees with the within-run check.
+BATCH      <- "extraction_batch"     # 2025-10 extraction batches 1 / 2; R1 = 2025-04
+# Candidate pathways (from the liver GSEA; followed up in CANDIDATE PATHWAYS and highlighted on
+# the volcano plots). OXPHOS uses nuclear-encoded genes only: the 11 mitochondrially encoded
+# genes track read quality (STAR unique %) and are scored separately as a technical flag.
+CANDIDATE_TERMS <- c(`OXPHOS (nuclear)`          = "GO:0006119",
+                     `Ribosome biogenesis`       = "GO:0042254",
+                     `Cell-substrate adhesion`   = "GO:0031589",
+                     `Neg. reg. immune response` = "GO:0050777")
+CANDIDATE_COLS  <- c(`OXPHOS (nuclear)` = "#B2182B", `Ribosome biogenesis` = "#E08214",
+                     `Cell-substrate adhesion` = "#2166AC", `Neg. reg. immune response` = "#1B7837")
+# Kupffer / leukocyte markers: is an immune-pathway shift a cell-composition shift?
+IMMUNE_MARKERS  <- c("Clec4f", "Vsig4", "Cd5l", "Marco", "Adgre1", "Ptprc")
+# construct contigs differ between groups by design, not biology -> excluded from DE
+CONSTRUCT_GENES <- c("Cre", "EGFP", "hAPP_5xFAD", "hPSEN1_5xFAD")
+HUMAN_APOE      <- "ENSG00000130203"
+
+## ---- figure standard: drawn at print size, no text below 6 pt -----------------------
+FONT <- "Helvetica"   # built into every R graphics device (Arial fails on the default pdf device)
+MM   <- c(single = 85, onehalf = 114, full = 174)
+pt   <- function(points) points / ggplot2::.pt
+GROUP_COLS <- c(GFP = "#4D9221", Cre = "#C51B7D")
+# comparison groups: primary Cre / GFP, plus the 2025-10 GFP batch-check samples
+CMP_COLS   <- c(`Cre (2025-10)` = "#C51B7D", `GFP (2025-04)` = "#4D9221",
+                `GFP check (2025-10)` = "#E08214")
+
+theme_bulk <- function(base = 7) {
+  theme_classic(base_size = base, base_family = FONT) +
+    theme(text = element_text(colour = "black"),
+          axis.text = element_text(size = base - 1, colour = "black"),
+          axis.line = element_line(linewidth = 0.3),
+          axis.ticks = element_line(linewidth = 0.3),
+          strip.background = element_blank(),
+          strip.text = element_text(size = base, face = "bold"),
+          legend.text = element_text(size = base - 1),
+          legend.key.size = unit(3, "mm"),
+          plot.title = element_text(size = base, face = "bold"),
+          plot.margin = margin(2, 2, 2, 2, "mm"))
+}
+
+save_plot <- function(p, stem, width = "single", height = 70) {
+  w <- if (is.character(width)) MM[[width]] else width
+  ggsave(paste0(stem, ".pdf"), p, width = w, height = height, units = "mm",
+         device = cairo_pdf, family = FONT)
+  ggsave(paste0(stem, ".png"), p, width = w, height = height, units = "mm",
+         dpi = 300, bg = "white")
+  invisible(stem)
+}
+
+# pheatmap draws to a device; render it to pdf + png at print size
+save_pheatmap <- function(ph, stem, width = "single", height = 85) {
+  w <- (if (is.character(width)) MM[[width]] else width) / 25.4
+  cairo_pdf(paste0(stem, ".pdf"), width = w, height = height / 25.4, family = FONT)
+  grid::grid.newpage(); grid::grid.draw(ph$gtable); dev.off()
+  png(paste0(stem, ".png"), width = w, height = height / 25.4, units = "in", res = 300)
+  grid::grid.newpage(); grid::grid.draw(ph$gtable); dev.off()
+  invisible(stem)
+}
+
+## cd ~/Documents/Liver4s2_BulkSeq/objects
+## R=MCC.uky.edu:/pscratch/lajo247_uksr/efad_bulkseq
+## rsync -rt $R/results/ ./mcc_results/
+## rsync -rt $R/qc/multiqc/ ./mcc_results/multiqc/
+```
+
+###PULL MATRICES FROM MCC###
+
+Run once after `run_all.sh` finishes on MCC (BAMs stay there).
+
+```{bash pull-results, eval = FALSE}
+cd ~/Documents/Liver4s2_BulkSeq/objects
+R=MCC.uky.edu:/pscratch/lajo247_uksr/efad_bulkseq
+rsync -rt $R/results/ ./mcc_results/
+rsync -rt $R/qc/multiqc/ ./mcc_results/multiqc/
+```
+
+###IMPORT (tutorial: Differential Expression with DESeq2 — data import)###
+
+```{r import}
+meta <- read_csv(file.path(IN_DIR, "sample_metadata.csv"), show_col_types = FALSE) |>
+  mutate(treatment        = factor(treatment, levels = c("GFP", "Cre")),
+         sex              = factor(sex),
+         extraction_batch = factor(extraction_batch),
+         tissue           = factor(tissue, levels = TISSUES),
+         cmp_group        = factor(case_when(arm != "AAV" ~ NA_character_,
+                                             treatment == "Cre" ~ "Cre (2025-10)",
+                                             run == GFP_RUN ~ "GFP (2025-04)",
+                                             TRUE ~ "GFP check (2025-10)"), levels = names(CMP_COLS))) |>
+  column_to_rownames("sample")
+
+# gene count matrix from COUNT_SOURCE (same custom GTF gene IDs for STAR and htseq-count)
+read_counts <- function(src) {
+  x <- fread(file.path(IN_DIR, "mcc_results", COUNT_FILES[[src]])) |> as.matrix(rownames = "GeneID")
+  storage.mode(x) <- "integer"
+  x
+}
+geneCounts <- read_counts(COUNT_SOURCE)
+message("Gene counts: ", COUNT_SOURCE)
+# per-gene union-exon length and GC fraction from the custom reference (14_gene_gc_length on MCC)
+gene_gcl <- read_tsv(file.path(IN_DIR, "mcc_results", "gene_gc_length.tsv"), show_col_types = FALSE)
+# Analyse every metadata sample that has been counted on MCC; anything not yet counted is listed.
+not_counted <- setdiff(rownames(meta), colnames(geneCounts))
+if (length(not_counted) > 0)
+  message("Not yet counted on MCC (left out of this render): ", paste(not_counted, collapse = ", "))
+meta        <- meta[rownames(meta) %in% colnames(geneCounts), , drop = FALSE]
+geneCounts <- geneCounts[, rownames(meta)]
+
+# tutorial's ENSG_ID2Name.txt equivalent, built from the custom GTF
+id2name <- fread(file.path(IN_DIR, "mcc_results", "gene_id2name.tsv"), header = FALSE,
+                 col.names = c("ensemblID", "Symbol", "biotype", "contig")) |>
+  mutate(Symbol = if_else(ensemblID == HUMAN_APOE, "hAPOE", Symbol))
+
+# StringTie gene TPM (HISAT2 alignments; expression-level plots only, DE uses COUNT_SOURCE counts)
+tpm <- fread(file.path(IN_DIR, "mcc_results", "gene_tpm_all_samples.tsv"))
+
+dim(geneCounts)
+colSums(geneCounts) |> summary()
+```
+
+```{r strandedness}
+# HISAT-only run: reads were aligned and counted UNSTRANDED (htseq-count --stranded no), because
+# the strand check was skipped. Unstranded counts are valid for either library type; they only
+# can't separate genes that overlap on opposite strands.
+#
+# ---- STRANDEDNESS (enable once 04_strand_check.sbatch has run on MCC) ------------------------
+# strandedness <- readLines(file.path(IN_DIR, "mcc_results", "..", "strandedness.txt"))  # RF | FR | none
+# message("Library strandedness: ", strandedness)
+# # If it reports RF/FR, rerun 06_expression -> 07_merge_and_qc on MCC (it picks the setting up
+# # automatically), re-pull mcc_results/, and re-knit from here. Expect higher % assigned and
+# # fewer htseq "__ambiguous" reads in the sample-QC plots after re-counting stranded.
+# -----------------------------------------------------------------------------------------------
+```
+
+###SAMPLE IDENTITY: CONSTRUCT + hAPOE EXPRESSION###
+
+Cre should appear only in Cre-AAV mice, EGFP only in GFP-AAV mice and the 5xFAD transgenes only in EFAD mice. APOE genotype calls (rs429358 / rs7412 from the BAMs) come from `08_apoe_genotype_transgenes.sbatch`.
+
+```{r construct-check, fig.width = 6.7, fig.height = 3.6}
+construct_tpm <- tpm |>
+  dplyr::filter(GeneID %in% c(CONSTRUCT_GENES, HUMAN_APOE)) |>
+  pivot_longer(-c(GeneID, GeneName), names_to = "sample", values_to = "tpm") |>
+  mutate(gene = if_else(GeneID == HUMAN_APOE, "hAPOE", GeneID),
+         gene = factor(gene, levels = c("Cre", "EGFP", "hAPOE", "hAPP_5xFAD", "hPSEN1_5xFAD"))) |>
+  left_join(rownames_to_column(meta, "sample"), by = "sample") |>
+  mutate(group = factor(group, levels = c("GFP Control", "Cre-AAV",
+                                          "E2/E2; F/+", "E3/E3; F/+", "E4/E4; F/+")))
+write_csv(construct_tpm, file.path(CSV_DIR, "qc", "construct_hAPOE_tpm.csv"))
+
+p_construct <- ggplot(construct_tpm, aes(group, log10(tpm + 1))) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.3, width = 0.6) +
+  geom_point(aes(shape = sex), size = 0.9, position = position_jitter(width = 0.15, seed = 1)) +
+  facet_grid(tissue ~ gene) +
+  scale_shape_manual(values = c(Female = 1, Male = 16)) +
+  labs(x = NULL, y = "log10(TPM + 1)", shape = NULL) +
+  theme_bulk() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "top")
+save_plot(p_construct, file.path(FIG_DIR, "qc", "construct_hAPOE_tpm"), "full", 95)
+p_construct
+
+apoe_calls <- read_tsv(file.path(IN_DIR, "mcc_results", "apoe_transgene_check",
+                                 "apoe_genotype_calls.tsv"), show_col_types = FALSE)
+
+# iCre: the AAV is EGFP-T2A-iCre. iCre (codon-improved Cre, GenBank AY056050) is not the
+# wild-type Cre contig in the reference, so its reads were counted separately from each sample's
+# unaligned reads (12_icre_count on MCC). Reads per million primary reads.
+icre_file <- file.path(IN_DIR, "mcc_results", "apoe_transgene_check", "construct_unaligned_reads.tsv")
+icre <- if (file.exists(icre_file)) {
+  x <- read_tsv(icre_file, show_col_types = FALSE) |>
+    pivot_wider(names_from = contig, values_from = reads, values_fill = 0)
+  if (!"iCre_AY056050" %in% names(x)) x$iCre_AY056050 <- 0   # no sample had an iCre read
+  transmute(x, sample, iCre_reads = iCre_AY056050,
+            iCre_rpm = 1e6 * iCre_reads / `__primary_reads`)
+} else tibble(sample = character(), iCre_reads = double(), iCre_rpm = double())
+write_csv(icre, file.path(CSV_DIR, "qc", "icre_reads.csv"))
+
+# Any sample whose construct / APOE readout contradicts its label. Both AAV arms carry EGFP
+# (GFP-only vs EGFP-T2A-iCre), so EGFP marks transduction and iCre / the liver E2 switch mark
+# the Cre arm. iCre mRNA from a single AAV-TBG dose declines over months, so low iCre alone is
+# not a failure; the APOE E2 allelic fraction (what Cre leaves behind) is the switch readout.
+construct_tpm |>
+  dplyr::select(sample, tissue, group, gene, tpm) |>
+  pivot_wider(names_from = gene, values_from = tpm) |>
+  left_join(dplyr::select(apoe_calls, sample, apoe_call = call, e2_frac = rs7412_T_frac),
+            by = "sample") |>
+  left_join(icre, by = "sample") |>
+  mutate(flag = case_when(
+    group %in% c("GFP Control", "Cre-AAV") & tissue == "Liver" & EGFP == 0 ~ "AAV label, no EGFP",
+    group == "GFP Control" & iCre_rpm > 0.5                                ~ "GFP label, iCre reads",
+    group == "Cre-AAV" & tissue == "Liver" & e2_frac < 0.5                 ~ "Cre label, liver not switched",
+    group == "GFP Control" & tissue == "Liver" & e2_frac > 0.5             ~ "GFP label, liver switched",
+    str_detect(group, "^E\\d") & str_sub(group, 1, 5) != apoe_call         ~ "APOE genotype mismatch",
+    TRUE ~ "")) |>
+  dplyr::select(sample, tissue, group, EGFP, iCre_reads, iCre_rpm, hAPOE, apoe_call, e2_frac, flag) |>
+  arrange(desc(flag != ""), tissue, group)
+```
+
+###SAMPLE QC###
+
+Per-sample metrics from the MCC run (fastp, HISAT2, htseq-count; `sample_qc_metrics.tsv`) plus metrics computed from the count matrix. Dashed red lines are the cut-offs in `QC_MIN` / `QC_MAX`; red points fail a cut-off or are > `QC_MAD` MADs worse than their tissue.
+
+```{r sample-qc-metrics}
+qc_raw <- read_tsv(file.path(IN_DIR, "mcc_results", "sample_qc_metrics.tsv"), show_col_types = FALSE)
+
+mito_genes <- id2name$ensemblID[id2name$contig == "MT"]
+rrna_genes <- id2name$ensemblID[id2name$biotype %in% c("rRNA", "rRNA_pseudogene", "Mt_rRNA")]
+lib        <- colSums(geneCounts)
+frac_of    <- function(genes) 100 * colSums(geneCounts[intersect(genes, rownames(geneCounts)), , drop = FALSE]) / lib
+
+count_qc <- tibble(
+  sample         = colnames(geneCounts),
+  detected_genes = colSums(geneCounts >= 5),
+  pct_mito       = frac_of(mito_genes),
+  pct_rrna       = frac_of(rrna_genes),
+  # share of reads taken by the 20 most-expressed genes (library complexity)
+  pct_top20      = 100 * map_dbl(colnames(geneCounts), \(s) sum(head(sort(geneCounts[, s], TRUE), 20))) / lib)
+
+qc <- qc_raw |>
+  left_join(count_qc, by = "sample") |>
+  left_join(rownames_to_column(meta, "sample") |> dplyr::select(sample, tissue, group, treatment, sex, rin),
+            by = "sample")
+
+qc_long <- qc |>
+  dplyr::select(sample, tissue, group, all_of(c(names(QC_MIN), names(QC_MAX)))) |>
+  pivot_longer(-c(sample, tissue, group), names_to = "metric", values_to = "value") |>
+  group_by(tissue, metric) |>
+  mutate(mad_z    = (value - median(value, na.rm = TRUE)) / mad(value, na.rm = TRUE),
+         lo       = unname(QC_MIN[metric]), hi = unname(QC_MAX[metric]),
+         fail_abs = (!is.na(lo) & value < lo) | (!is.na(hi) & value > hi),
+         # one-sided: only the bad direction counts (deep libraries are not outliers)
+         fail_mad = is.finite(mad_z) &
+                    ((metric %in% names(QC_MIN) & mad_z < -QC_MAD) |
+                     (metric %in% names(QC_MAX) & mad_z >  QC_MAD)),
+         flag     = fail_abs | fail_mad) |>
+  ungroup()
+
+qc_flags <- qc_long |>
+  dplyr::filter(flag) |>
+  mutate(reason = sprintf("%s=%s%s", metric, signif(value, 3),
+                          if_else(fail_abs, " (cut-off)", sprintf(" (%.1f MAD)", mad_z)))) |>
+  group_by(sample, tissue, group) |>
+  summarise(n_flags = n(), reasons = paste(reason, collapse = "; "), .groups = "drop") |>
+  arrange(desc(n_flags))
+
+write_csv(qc, file.path(CSV_DIR, "qc", "sample_qc_metrics.csv"))
+write_csv(qc_flags, file.path(CSV_DIR, "qc", "sample_qc_flags.csv"))
+qc_flags
+```
+
+```{r sample-qc-plots, fig.width = 6.7, fig.height = 7.8}
+metric_labels <- c(raw_read_pairs = "Raw read pairs", htseq_assigned = "Reads assigned",
+                   hisat2_overall_alignment_pct = "Aligned (%)",
+                   hisat2_concordant_unique_pct = "Concordant unique (%)",
+                   pct_assigned_to_genes = "Assigned to genes (%)", detected_genes = "Genes detected",
+                   pct_mito = "Mito reads (%)", pct_rrna = "rRNA reads (%)",
+                   pct_top20 = "Top-20 gene share (%)", rin = "RIN")
+sample_levels <- str_sort(unique(qc_long$sample), numeric = TRUE)
+qc_plot_df <- qc_long |>
+  mutate(metric = factor(metric, levels = names(metric_labels), labels = metric_labels),
+         sample = factor(sample, levels = sample_levels))
+cutoffs <- qc_plot_df |>
+  dplyr::distinct(metric, tissue, lo, hi) |>
+  pivot_longer(c(lo, hi), values_to = "cut") |>
+  dplyr::filter(!is.na(cut))
+
+p_qc <- ggplot(qc_plot_df, aes(sample, value)) +
+  geom_segment(aes(xend = sample, y = 0, yend = value), linewidth = 0.25, colour = "grey75") +
+  geom_point(aes(colour = flag, shape = group), size = 1.1) +
+  geom_hline(aes(yintercept = cut), data = cutoffs, linetype = 2, linewidth = 0.25,
+             colour = "#B2182B") +
+  facet_grid(metric ~ tissue, scales = "free", switch = "y") +
+  scale_colour_manual(values = c(`FALSE` = "black", `TRUE` = "#B2182B"), guide = "none") +
+  scale_shape_manual(values = c(`Cre-AAV` = 16, `GFP Control` = 1, `E2/E2; F/+` = 15,
+                                `E3/E3; F/+` = 17, `E4/E4; F/+` = 18)) +
+  scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  labs(x = NULL, y = NULL, shape = NULL) +
+  theme_bulk() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 6),
+        strip.placement = "outside", strip.text.y.left = element_text(angle = 0, size = 6),
+        legend.position = "top")
+save_plot(p_qc, file.path(FIG_DIR, "qc", "sample_qc_metrics"), "full", 200)
+p_qc
+```
+
+```{r sample-qc-composition, fig.width = 6.7, fig.height = 3}
+# Where each sample's aligned read pairs went: assigned to a gene vs htseq-count's __ categories
+p_comp <- qc |>
+  dplyr::select(sample, tissue, starts_with("htseq_"), -any_of("htseq_not_aligned")) |>
+  pivot_longer(starts_with("htseq_"), names_to = "category", values_to = "n") |>
+  mutate(category = str_remove(category, "^htseq_") |> str_replace_all("_", " "),
+         sample = factor(sample, levels = sample_levels)) |>
+  group_by(sample) |> mutate(frac = n / sum(n)) |> ungroup() |>
+  ggplot(aes(sample, frac, fill = category)) +
+  geom_col(width = 0.8) +
+  facet_wrap(~ tissue, scales = "free_x") +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = "Aligned read pairs", fill = NULL) +
+  theme_bulk() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 6),
+                       legend.position = "top")
+save_plot(p_comp, file.path(FIG_DIR, "qc", "htseq_assignment_composition"), "full", 80)
+p_comp
+```
+
+```{r tissue-purity, fig.width = 6.7, fig.height = 2.6}
+# Cross-tissue contamination / mislabelling: expression of canonical markers of the OTHER tissue.
+# Hepatocyte: secreted plasma proteins; brain: neuronal and oligodendrocyte genes. A sample is
+# flagged if its other-tissue marker CPM is > 10x its own tissue's median (standard marker-based
+# purity screen; liver RNA in brain shows up first as Alb / Apoa1 / Serpina1).
+PURITY_MARKERS <- list(liver = c("Alb", "Apoa1", "Apoh", "Ahsg", "Fgb", "Serpina1a"),
+                       brain = c("Snap25", "Syt1", "Plp1", "Mbp", "Gfap"))
+cpm_all <- t(t(geneCounts) / colSums(geneCounts) * 1e6)
+marker_cpm <- function(sym) {
+  ids <- id2name$ensemblID[id2name$Symbol %in% sym]
+  colSums(cpm_all[intersect(ids, rownames(cpm_all)), , drop = FALSE])
+}
+purity <- tibble(sample = colnames(cpm_all),
+                 liver_marker_cpm = marker_cpm(PURITY_MARKERS$liver),
+                 brain_marker_cpm = marker_cpm(PURITY_MARKERS$brain)) |>
+  left_join(rownames_to_column(meta, "sample") |> dplyr::select(sample, tissue, group), by = "sample") |>
+  mutate(other_cpm = if_else(tissue == "Liver", brain_marker_cpm, liver_marker_cpm)) |>
+  group_by(tissue) |>
+  mutate(fold_over_median = other_cpm / median(other_cpm),
+         flag = fold_over_median > 10) |>
+  ungroup()
+write_csv(purity, file.path(CSV_DIR, "qc", "tissue_purity_markers.csv"))
+dplyr::filter(purity, flag)
+
+p_purity <- purity |>
+  mutate(panel = if_else(tissue == "Liver", "Brain markers in liver", "Liver markers in brain")) |>
+  ggplot(aes(group, other_cpm + 1)) +
+  geom_point(aes(colour = flag), size = 0.9, position = position_jitter(width = 0.15, seed = 1)) +
+  facet_wrap(~ panel, scales = "free") +
+  scale_y_log10() +
+  scale_colour_manual(values = c(`FALSE` = "grey40", `TRUE` = "#C51B7D"), guide = "none") +
+  labs(x = NULL, y = "Other-tissue marker CPM + 1") +
+  theme_bulk() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+save_plot(p_purity, file.path(FIG_DIR, "qc", "tissue_purity_markers"), "full", 70)
+p_purity
+```
+
+```{r sample-exclude}
+excluded <- if (is.null(names(QC_EXCLUDE))) QC_EXCLUDE else names(QC_EXCLUDE)
+if (length(excluded)) message("Excluding: ", paste(excluded, collapse = ", "))
+meta <- meta[!rownames(meta) %in% excluded, , drop = FALSE]
+geneCounts <- geneCounts[, rownames(meta)]
+table(meta$tissue, meta$group)
+```
+
+###GENE QC: DROP LOW-QUALITY GENES###
+
+Applied per tissue (AAV mice) before DESeq2:
+
+1.  construct contigs (Cre, EGFP, hAPP, hPSEN1) removed, because they differ by design;
+2.  technical / non-polyA biotypes (`DROP_BIOTYPES`: rRNA, mt-rRNA/tRNA, snoRNA, ...) removed;
+3.  predicted / unnamed genes (`DROP_PREDICTED`: Gm, Rik, LOC, cDNA clones, no symbol) and cytosolic ribosomal-protein genes (`DROP_RIBO`: Rpl, Rps) removed;
+4.  expression filter. **strict** (default): CPM ≥ `MIN_COUNT` / median library size (in millions) in at least as many samples as the smallest group, and ≥ `MIN_TOTAL` reads in total (the `edgeR::filterByExpr` rule). **tutorial**: ≥ 10 reads in ≥ 1 sample.
+
+```{r gene-qc}
+filter_genes <- function(tissue) {
+  m   <- meta[meta$tissue == tissue & meta$arm == "AAV", , drop = FALSE]
+  cts <- geneCounts[, rownames(m), drop = FALSE]
+  lib <- colSums(cts)
+  min_cpm <- MIN_COUNT / (median(lib) / 1e6)
+  n_min   <- min(table(m$treatment))
+  cpm     <- t(t(cts) / lib * 1e6)
+
+  genes <- tibble(ensemblID   = rownames(cts),
+                  Symbol      = id2name$Symbol[match(rownames(cts), id2name$ensemblID)],
+                  biotype     = id2name$biotype[match(rownames(cts), id2name$ensemblID)],
+                  total       = rowSums(cts),
+                  n_min_reads = rowSums(cts >= MIN_COUNT),
+                  n_cpm_ok    = rowSums(cpm >= min_cpm)) |>
+    mutate(reason = case_when(
+      ensemblID %in% CONSTRUCT_GENES                                    ~ "construct contig",
+      biotype %in% DROP_BIOTYPES                                        ~ "technical biotype",
+      is.na(Symbol) | Symbol == "" | Symbol == ensemblID |
+        str_detect(Symbol, DROP_PREDICTED)                              ~ "predicted gene",
+      str_detect(Symbol, DROP_RIBO)                                     ~ "ribosomal protein",
+      GENE_FILTER == "tutorial" & n_min_reads < 1                       ~ "low expression",
+      GENE_FILTER == "strict" & (n_cpm_ok < n_min | total < MIN_TOTAL)  ~ "low expression",
+      TRUE                                                              ~ "kept"))
+  list(tissue = tissue, genes = genes, keep = genes$ensemblID[genes$reason == "kept"],
+       min_cpm = min_cpm, n_min = n_min)
+}
+
+gene_qc <- map(TISSUES, filter_genes) |> set_names(TISSUES)
+
+gene_qc_summary <- imap(gene_qc, \(g, t) dplyr::count(g$genes, reason) |>
+                          mutate(tissue = t, min_cpm = round(g$min_cpm, 2), n_min = g$n_min)) |>
+  bind_rows() |>
+  pivot_wider(names_from = reason, values_from = n, values_fill = 0)
+write_csv(gene_qc_summary, file.path(CSV_DIR, "qc", "gene_filter_summary.csv"))
+iwalk(gene_qc, \(g, t) write_csv(dplyr::filter(g$genes, reason != "kept"),
+                                 file.path(CSV_DIR, "qc", sprintf("%s_dropped_genes.csv", tolower(t)))))
+gene_qc_summary
+```
+
+```{r gene-qc-plots, fig.width = 6.7, fig.height = 4.5}
+# log-CPM density of every sample before vs after filtering, with the CPM cut-off
+logcpm_long <- function(g, stage) {
+  m    <- meta[meta$tissue == g$tissue & meta$arm == "AAV", , drop = FALSE]
+  cts  <- geneCounts[, rownames(m), drop = FALSE]
+  lib  <- colSums(cts)
+  if (stage == "after") cts <- cts[g$keep, , drop = FALSE]
+  lcpm <- log2(t(t(cts) / lib * 1e6) + 0.5)
+  as_tibble(lcpm, rownames = "gene") |>
+    pivot_longer(-gene, names_to = "sample", values_to = "logcpm") |>
+    mutate(tissue = g$tissue, stage = stage, cut = log2(g$min_cpm + 0.5))
+}
+
+dens <- expand_grid(t = TISSUES, stage = c("before", "after")) |>
+  pmap(\(t, stage) logcpm_long(gene_qc[[t]], stage)) |>
+  bind_rows() |>
+  mutate(stage = factor(stage, levels = c("before", "after"),
+                        labels = c("Before filtering", "After filtering")),
+         tissue = factor(tissue, levels = TISSUES),
+         treatment = meta$treatment[match(sample, rownames(meta))])
+
+p_dens <- ggplot(dens, aes(logcpm, group = sample, colour = treatment)) +
+  geom_density(linewidth = 0.25) +
+  geom_vline(aes(xintercept = cut), data = dplyr::distinct(dens, tissue, stage, cut),
+             linetype = 2, linewidth = 0.25) +
+  facet_grid(tissue ~ stage) +
+  scale_colour_manual(values = GROUP_COLS) +
+  labs(x = "log2(CPM + 0.5)", y = "Density", colour = NULL) +
+  theme_bulk() + theme(legend.position = "top")
+
+p_kept <- gene_qc_summary |>
+  pivot_longer(-c(tissue, min_cpm, n_min), names_to = "reason", values_to = "n") |>
+  mutate(reason = fct_relevel(reason, "kept"), tissue = factor(tissue, levels = TISSUES)) |>
+  ggplot(aes(tissue, n, fill = reason)) +
+  geom_col(width = 0.6) +
+  scale_fill_manual(values = c(kept = "grey30", `low expression` = "grey70",
+                               `technical biotype` = "#E08214", `construct contig` = "#8073AC",
+                               `predicted gene` = "#FDB863", `ribosomal protein` = "#B2ABD2")) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(x = NULL, y = "Genes", fill = NULL) +
+  theme_bulk()
+
+p_gene_qc <- p_dens + p_kept + plot_layout(widths = c(3, 1))
+save_plot(p_gene_qc, file.path(FIG_DIR, "qc", "gene_filter_logcpm_density"), "full", 100)
+p_gene_qc
+```
+
+###TECHNICAL CONFOUNDING CHECK###
+
+Ribosomal-protein and mitochondrial read fractions are technical readouts of RNA extraction / library prep. If they track extraction batch rather than treatment, any "translation / OXPHOS" signal in a model without batch is an artifact. Batch is therefore in the design (`design_for()`).
+
+```{r technical-check, fig.width = 6.7, fig.height = 2.8}
+ribo_rx <- "^Rp[ls]\\d+[a-z]?\\d*$|^Rplp\\d$|^Rpsa$"
+sym     <- id2name$Symbol[match(rownames(geneCounts), id2name$ensemblID)]
+lib     <- colSums(geneCounts)
+tech <- tibble(sample  = colnames(geneCounts),
+               pct_ribosomal_protein = 100 * colSums(geneCounts[str_detect(replace_na(sym, ""), ribo_rx) %in% TRUE, ]) / lib,
+               pct_mitochondrial     = 100 * colSums(geneCounts[str_detect(replace_na(sym, ""), "^mt-") %in% TRUE, ]) / lib) |>
+  left_join(rownames_to_column(meta, "sample"), by = "sample") |>
+  dplyr::filter(arm == "AAV")
+write_csv(tech, file.path(CSV_DIR, "qc", "technical_fractions_by_batch.csv"))
+
+# treatment x batch layout per tissue
+dplyr::count(tech, tissue, treatment, .data[[BATCH]]) |>
+  pivot_wider(names_from = all_of(BATCH), values_from = n, values_fill = 0, names_prefix = "batch_")
+
+# correlation of each fraction with treatment and with batch
+tech |>
+  pivot_longer(starts_with("pct_"), names_to = "metric", values_to = "value") |>
+  group_by(tissue, metric) |>
+  # variance explained (R^2) by each factor alone; batch has 3 levels, so R^2 rather than r
+  summarise(r2_treatment = summary(lm(value ~ treatment))$r.squared,
+            r2_batch     = summary(lm(value ~ .data[[BATCH]]))$r.squared,
+            r2_rin       = summary(lm(value ~ rin))$r.squared, .groups = "drop")   # basis for USE_RIN
+
+p_tech <- tech |>
+  pivot_longer(starts_with("pct_"), names_to = "metric", values_to = "value") |>
+  mutate(metric = recode(metric, pct_ribosomal_protein = "Ribosomal protein reads (%)",
+                         pct_mitochondrial = "Mitochondrial reads (%)"),
+         batch = paste("Batch", .data[[BATCH]])) |>
+  ggplot(aes(batch, value, colour = treatment)) +
+  geom_point(size = 1.2, position = position_dodge(width = 0.5)) +
+  facet_grid(metric ~ tissue, scales = "free_y", switch = "y") +
+  scale_colour_manual(values = GROUP_COLS) +
+  labs(x = NULL, y = NULL, colour = NULL) +
+  theme_bulk() + theme(strip.placement = "outside", legend.position = "right")
+save_plot(p_tech, file.path(FIG_DIR, "qc", "technical_fractions_by_batch"), "full", 75)
+p_tech
+```
+
+###BRIDGE CHECK: SAME MICE IN BOTH RUNS###
+
+SAD_326 and MAD_271 were sequenced in both runs. The same tissue from the same mouse should differ only technically, so the 2025-04 vs 2025-10 difference for these pairs is the run effect. It is compared with the spread between *different* GFP mice within the 2025-04 run, and the APOE genotype calls are lined up to confirm each pair is the same animal.
+
+```{r bridge-check, fig.width = 6.7, fig.height = 4.6}
+bridge <- meta |> rownames_to_column("sample") |>
+  dplyr::filter(arm == "AAV", treatment == "GFP") |>
+  group_by(tissue, mouse_id) |> dplyr::filter(n_distinct(run) == 2) |> ungroup()
+
+if (nrow(bridge) == 0) {
+  message("No bridge pairs counted yet")
+} else {
+  logcpm_tissue <- function(tissue) {
+    cts <- geneCounts[gene_qc[[tissue]]$keep, , drop = FALSE]
+    log2(t(t(cts) / colSums(cts) * 1e6) + 1)
+  }
+  lc <- map(set_names(TISSUES), logcpm_tissue)
+  # bridge pairs: same mouse, two runs
+  pair_stats <- bridge |>
+    dplyr::select(tissue, mouse_id, run, sample) |>
+    pivot_wider(names_from = run, values_from = sample) |>
+    mutate(type = "same mouse, 2025-04 vs 2025-10",
+           r = pmap_dbl(list(tissue, `2025-04`, `2025-10`), \(t, a, b) cor(lc[[t]][, a], lc[[t]][, b])),
+           n_genes_2fold = pmap_int(list(tissue, `2025-04`, `2025-10`),
+                                    \(t, a, b) sum(abs(lc[[t]][, a] - lc[[t]][, b]) > 1)))
+  # reference: different GFP mice within the 2025-04 run
+  ref_stats <- map(TISSUES, \(t) {
+    s <- rownames(meta)[meta$tissue == t & meta$treatment == "GFP" & meta$run == "2025-04"]
+    combn(s, 2, simplify = FALSE) |>
+      map(\(p) tibble(tissue = t, a = p[1], b = p[2],
+                      r = cor(lc[[t]][, p[1]], lc[[t]][, p[2]]),
+                      n_genes_2fold = sum(abs(lc[[t]][, p[1]] - lc[[t]][, p[2]]) > 1)))
+  }) |> bind_rows() |> mutate(type = "different mice, 2025-04")
+  bridge_summary <- bind_rows(
+    dplyr::select(pair_stats, tissue, type, mouse_id, r, n_genes_2fold),
+    ref_stats |> group_by(tissue, type) |>
+      summarise(mouse_id = "median of all pairs", r = median(r),
+                n_genes_2fold = as.integer(median(n_genes_2fold)), .groups = "drop"))
+  write_csv(bridge_summary, file.path(CSV_DIR, "qc", "bridge_replicate_check.csv"))
+  print(bridge_summary)
+
+  geno_file <- file.path(IN_DIR, "mcc_results", "apoe_transgene_check", "apoe_genotype_calls.tsv")
+  if (file.exists(geno_file))
+    read_tsv(geno_file, show_col_types = FALSE) |>
+      dplyr::filter(sample %in% bridge$sample) |>
+      left_join(dplyr::select(bridge, sample, mouse_id, tissue, run), by = "sample") |>
+      arrange(tissue, mouse_id, run) |> print()
+
+  p_bridge <- pmap(dplyr::select(pair_stats, tissue, mouse_id, `2025-04`, `2025-10`, r),
+                   \(tissue, mouse_id, `2025-04`, `2025-10`, r)
+    ggplot(tibble(x = lc[[tissue]][, `2025-04`], y = lc[[tissue]][, `2025-10`]), aes(x, y)) +
+      geom_point(size = 0.2, alpha = 0.3, stroke = 0) +
+      geom_abline(linewidth = 0.3, colour = "#C51B7D") +
+      labs(title = sprintf("%s · %s (r = %.3f)", tissue, mouse_id, r),
+           x = "2025-04 log2(CPM + 1)", y = "2025-10 log2(CPM + 1)") +
+      theme_bulk()) |>
+    wrap_plots(ncol = 2)
+  save_plot(p_bridge, file.path(FIG_DIR, "qc", "bridge_replicates"), "full", 120)
+  p_bridge
+}
+```
+
+###DESEQ2: CRE vs GFP (tutorial: Differential Expression with DESeq2)###
+
+```{r deseq-helpers}
+# AAV samples of a tissue. dedup = TRUE (every model): ONE sample per mouse. MAD_271 and SAD_326
+# were sequenced in both runs (the same animals, not separate controls), so their 2025-04 copy is
+# dropped wherever a usable 2025-10 copy exists; the 2025-10 copy is kept because it anchors the
+# batch term against the 2025-10 Cre mice. (SAD_326 brain: its 2025-10 sample B13 is excluded as
+# a sample swap, so its 2025-04 brain R1_B1 is its only copy.) dedup = FALSE keeps both copies, for
+# the analyses that use the replicates as replicates (bridge check, replicate floor, benchmark).
+aav_meta <- function(tissue, dedup = TRUE) {
+  m <- meta[meta$tissue == tissue & meta$arm == "AAV", , drop = FALSE]
+  if (!dedup) return(m)
+  dup <- m |> rownames_to_column("sample") |> group_by(mouse_id) |>
+    dplyr::filter(n() > 1, run == GFP_RUN, any(run == CRE_RUN)) |> pull(sample)
+  m[!rownames(m) %in% dup, , drop = FALSE]
+}
+
+# cqn normalisation factors (genes x samples, geometric mean 1 per gene) for a count matrix
+cqn_nf <- function(cts) {
+  gi <- match(rownames(cts), gene_gcl$GeneID)
+  cq <- cqn::cqn(cts, x = gene_gcl$gc[gi], lengths = gene_gcl$length[gi],
+                 sizeFactors = colSums(cts), verbose = FALSE)
+  nf <- exp(cq$glm.offset)
+  nf / exp(rowMeans(log(nf)))
+}
+# apply NORMALIZATION to a DESeqDataSet (DESeq() then uses these factors)
+norm_dds <- function(dds) {
+  if (NORMALIZATION == "cqn") {
+    normalizationFactors(dds) <- cqn_nf(counts(dds))
+    dds
+  } else estimateSizeFactors(dds)
+}
+run_coef  <- function(dds) grep("^run_", resultsNames(dds), value = TRUE)
+
+# Per-gene run offset (log2 2025-10 / 2025-04): FULL correction = unshrunk MLE run log2FC from
+# all GFP samples of the tissue (~ sex + run). `drop` leaves 2025-10 GFP samples out (checks).
+gfp_meta <- function(tissue, drop = character(), dedup = TRUE)
+  aav_meta(tissue, dedup) |> rownames_to_column("sample") |>
+  dplyr::filter(treatment == "GFP", !sample %in% drop) |> column_to_rownames("sample") |>
+  mutate(run = factor(run, levels = c(GFP_RUN, CRE_RUN))) |> droplevels()
+
+run_offset <- function(tissue, drop = character()) {
+  genes <- gene_qc[[tissue]]$keep
+  gm  <- gfp_meta(tissue, drop)
+  dg  <- DESeqDataSetFromMatrix(geneCounts[genes, rownames(gm)], gm, ~ sex + run) |>
+    norm_dds() |> DESeq(quiet = TRUE)
+  off <- results(dg, name = run_coef(dg))$log2FoldChange
+  set_names(replace_na(off, 0), genes)
+}
+
+# Normalization factors = size factors x run offset on the 2025-04 samples, rescaled so each
+# gene's factors have geometric mean 1 (as DESeq2 expects).
+offset_nf <- function(dds, offset) {
+  base <- if (NORMALIZATION == "cqn") cqn_nf(counts(dds)) else
+    matrix(sizeFactors(estimateSizeFactors(dds)), nrow(dds), ncol(dds), byrow = TRUE,
+           dimnames = dimnames(dds))
+  old <- colData(dds)$run == GFP_RUN
+  base[, old] <- base[, old] * 2^(-offset[rownames(dds)])
+  normalizationFactors(dds) <- base / exp(rowMeans(log(base)))
+  dds
+}
+
+# Batch term for a set of samples: 2025-10 extraction batch (1 / 2, with 2025-04 = R1) if every
+# 2025-10 extraction batch contains a GFP mouse, so treatment is estimated within batch;
+# otherwise sequencing run only (e.g. brain after excluding B13: batch 1 has no GFP, and an
+# extraction-batch term would leave Cre vs GFP resting on the single batch-2 Cre mouse).
+design_for <- function(m) {
+  new <- m[m$run == CRE_RUN, , drop = FALSE]
+  ok  <- all(tapply(new$treatment == "GFP", droplevels(new[[BATCH]]), any))
+  multi_run <- n_distinct(m$run) > 1
+  if (ok && n_distinct(new[[BATCH]]) > 1) ~ sex + extraction_batch + treatment
+  else if (multi_run) ~ sex + run + treatment
+  else ~ sex + treatment
+}
+
+# PRIMARY: one GLM over 2025-10 Cre, 2025-10 GFP and 2025-04 GFP. The batch term removes the run
+# difference completely (full correction) and propagates its uncertainty; the 2025-04 GFP
+# contribute to the dispersion estimates. `drop` leaves samples out (leave-one-out).
+fit_primary <- function(tissue, drop = character()) {
+  m   <- aav_meta(tissue)
+  m   <- m[!rownames(m) %in% drop, , drop = FALSE] |> droplevels()
+  dds <- DESeqDataSetFromMatrix(geneCounts[gene_qc[[tissue]]$keep, rownames(m)], m,
+                                design_for(m)) |> norm_dds() |> DESeq(quiet = TRUE)
+  stopifnot(COEF %in% resultsNames(dds))
+  dds
+}
+
+run_deseq <- function(tissue) {
+  genes  <- gene_qc[[tissue]]$keep
+  offset <- run_offset(tissue)        # used for the correction check and the figures only
+  dds    <- fit_primary(tissue)
+  res    <- results(dds, name = COEF, alpha = PADJ_CUT)
+  resLFC <- lfcShrink(dds, coef = COEF, type = "apeglm", quiet = TRUE)
+
+  # check 1: uncorrected run difference among GFP, then out-of-sample: each 2025-10 GFP sample
+  # is left out of the offset estimate and compared with the corrected 2025-04 GFP
+  gm     <- gfp_meta(tissue)
+  before <- DESeqDataSetFromMatrix(geneCounts[genes, rownames(gm)], gm, ~ sex + run) |>
+    norm_dds() |> DESeq(quiet = TRUE) |> results(alpha = PADJ_CUT)
+  checks <- rownames(gm)[gm$run == CRE_RUN]
+  oos <- map(set_names(checks), \(k) {
+    om  <- gm[gm$run == GFP_RUN | rownames(gm) == k, , drop = FALSE] |> droplevels()
+    d   <- DESeqDataSetFromMatrix(geneCounts[genes, rownames(om)], om, ~ run) |>
+      offset_nf(run_offset(tissue, drop = k)) |> DESeq(quiet = TRUE)
+    results(d, name = run_coef(d), alpha = PADJ_CUT)
+  })
+
+  # check 2: within-run Cre vs GFP (2025-10 only)
+  wm <- aav_meta(tissue) |> dplyr::filter(run == CRE_RUN) |> droplevels()
+  within <- DESeqDataSetFromMatrix(geneCounts[genes, rownames(wm)], wm, design_for(wm)) |>
+    norm_dds() |> DESeq(quiet = TRUE) |> results(name = COEF, alpha = PADJ_CUT)
+
+  # check 3: leave-one-out over the 2025-10 GFP (batch-control) mice
+  loo <- if (length(checks) > 1)
+    map(set_names(checks), \(k) {
+      d <- fit_primary(tissue, drop = k)
+      list(res = results(d, name = COEF, alpha = PADJ_CUT),
+           lfc = lfcShrink(d, coef = COEF, type = "apeglm", quiet = TRUE)$log2FoldChange)
+    }) else list()
+
+  # display object: every AAV sample of the tissue, offset applied to 2025-04, for PCA/heatmaps
+  am <- aav_meta(tissue) |> droplevels()
+  dds_display <- DESeqDataSetFromMatrix(geneCounts[genes, rownames(am)], am, ~ 1) |>
+    offset_nf(offset)
+
+  list(dds = dds, res = res, resLFC = resLFC, offset = offset, checks = checks,
+       design = paste(deparse(design(dds)), collapse = ""),
+       check_before = before, check_oos = oos, within = within, loo = loo,
+       dds_display = dds_display)
+}
+
+# Tutorial output table + run offset + the three checks + robust flag.
+de_table <- function(fit) {
+  norm <- counts(fit$dds, normalized = TRUE) |> as_tibble(rownames = "ensemblID")
+  loo_ok <- if (length(fit$loo))
+    map(fit$loo, \(l) !is.na(l$res$padj) & l$res$padj < PADJ_CUT &
+                      sign(l$res$log2FoldChange) == sign(fit$res$log2FoldChange)) |>
+      purrr::reduce(`&`) else rep(TRUE, nrow(fit$res))
+  as_tibble(as.data.frame(fit$res), rownames = "ensemblID") |>
+    mutate(log2FoldChange_shrunk  = fit$resLFC$log2FoldChange,
+           run_offset_log2        = fit$offset[ensemblID],
+           log2FoldChange_withinrun = fit$within$log2FoldChange,
+           padj_withinrun         = fit$within$padj,
+           loo_sig                = loo_ok,
+           direction_agrees       = sign(log2FoldChange) == sign(log2FoldChange_withinrun),
+           robust = !is.na(padj) & padj < PADJ_CUT & loo_sig & direction_agrees %in% TRUE) |>
+    left_join(dplyr::select(id2name, ensemblID, Symbol, biotype), by = "ensemblID") |>
+    relocate(ensemblID, Symbol, biotype) |>
+    left_join(norm, by = "ensemblID") |>
+    arrange(padj)
+}
+```
+
+```{r deseq-run}
+fits <- tibble(tissue = TISSUES) |>
+  mutate(fit = map(tissue, run_deseq),
+         de  = map(fit, de_table))
+
+pwalk(fits, \(tissue, fit, de) {
+  stem <- file.path(OBJ_DIR, tolower(tissue))
+  saveRDS(fit$dds, paste0(stem, "_dds.rds"))
+  saveRDS(fit$res, paste0(stem, "_res.rds"))
+  saveRDS(fit$resLFC, paste0(stem, "_resLFC.rds"))
+  write_tsv(de, file.path(CSV_DIR, "deseq2", sprintf("%s_DE_all_genes_DESeq2.tsv", tolower(tissue))))
+  write_tsv(dplyr::filter(de, padj < PADJ_CUT),
+            file.path(CSV_DIR, "deseq2", sprintf("%s_DE_sig_genes_DESeq2.tsv", tolower(tissue))))
+})
+
+de_summary <- fits |>
+  transmute(tissue,
+            n_tested   = map_int(de, \(d) sum(!is.na(d$padj))),
+            n_sig      = map_int(de, \(d) sum(d$padj < PADJ_CUT, na.rm = TRUE)),
+            n_up_Cre   = map_int(de, \(d) sum(d$padj < PADJ_CUT & d$log2FoldChange > 0, na.rm = TRUE)),
+            n_down_Cre = map_int(de, \(d) sum(d$padj < PADJ_CUT & d$log2FoldChange < 0, na.rm = TRUE)),
+            n_robust   = map_int(de, \(d) sum(d$robust)),
+            design     = map_chr(fit, "design"),
+            gfp_checks = map_chr(fit, \(f) paste(f$checks, collapse = ", ")),
+            n_sig_withinrun = map_int(fit, \(f) sum(f$within$padj < PADJ_CUT, na.rm = TRUE)),
+            hAPOE_log2FC = map_dbl(de, \(d) d$log2FoldChange_shrunk[d$ensemblID == HUMAN_APOE] %||% NA),
+            hAPOE_padj   = map_dbl(de, \(d) d$padj[d$ensemblID == HUMAN_APOE] %||% NA))
+write_csv(de_summary, file.path(CSV_DIR, "deseq2", "DE_summary.csv"))
+de_summary
+
+# check 1: run difference among GFP before correction, and after correction for each 2025-10
+# GFP mouse left out of the offset estimate (out-of-sample: the correction has not seen it)
+run_check <- fits |>
+  transmute(tissue,
+            run_DE_genes_uncorrected = map_int(fit, \(f) sum(f$check_before$padj < PADJ_CUT, na.rm = TRUE)),
+            genes_with_offset_over_1.5x = map_int(fit, \(f) sum(abs(f$offset) > log2(1.5))),
+            oos = map(fit, \(f) imap(f$check_oos, \(r, k) tibble(left_out = k,
+              run_DE_genes_after = sum(r$padj < PADJ_CUT, na.rm = TRUE))) |> bind_rows())) |>
+  unnest(oos)
+write_csv(run_check, file.path(CSV_DIR, "deseq2", "run_correction_check.csv"))
+run_check
+
+# check 2: agreement of the primary LFC with the within-run (2025-10 only) LFC
+fits |> transmute(tissue, agree = map(de, \(d) d |> dplyr::filter(padj < PADJ_CUT) |>
+  summarise(n_sig = n(), same_direction = mean(direction_agrees, na.rm = TRUE),
+            r_lfc = if (n() >= 3) cor(log2FoldChange, log2FoldChange_withinrun,
+                                      use = "complete.obs") else NA_real_))) |>
+  unnest(agree)
+
+# top / bottom 10 significant genes by log2FC (tutorial)
+fits |>
+  transmute(tissue, top = map(de, \(d) d |> dplyr::filter(padj < PADJ_CUT) |>
+                                 arrange(desc(log2FoldChange)) |>
+                                 (\(x) bind_rows(head(x, 10), tail(x, 10)))() |>
+                                 dplyr::select(Symbol, baseMean, log2FoldChange, log2FoldChange_shrunk,
+                                               padj, log2FoldChange_withinrun, robust))) |>
+  unnest(top)
+```
+
+###ALIGNER COMPARISON: HISAT2 vs STAR (internal check)###
+
+Gene counts for every analysis come from `COUNT_SOURCE` (STAR 2.7.11b, `--quantMode GeneCounts`, unstranded column, on the same fastp-trimmed reads and custom reference / GTF). The tutorial route, HISAT2 + htseq-count *intersection-strict*, is kept here as the internal comparison: the full analysis (batch model, checks) is rerun on those counts to show whether any conclusion depends on the aligner. STAR counts reads overlapping a single gene (htseq *union*-like), so its counts run slightly higher than intersection-strict.
+
+```{r aligner-compare, fig.width = 6.7, fig.height = 5.5}
+star_file <- file.path(IN_DIR, "mcc_results", "star_gene_counts.tsv")
+if (!file.exists(star_file)) {
+  message("STAR counts not pulled yet (results/star_gene_counts.tsv); skipping")
+} else {
+  ALT_SOURCE <- setdiff(names(COUNT_FILES), COUNT_SOURCE)
+  altCounts  <- read_counts(ALT_SOURCE)[rownames(geneCounts), colnames(geneCounts)]
+
+  # 1. mapping: HISAT2 concordant-unique vs STAR uniquely mapped
+  star_map <- read_tsv(file.path(IN_DIR, "mcc_results", "star_mapping_summary.tsv"),
+                       show_col_types = FALSE)
+  map_cmp <- qc_raw |>
+    dplyr::select(sample, hisat2_concordant_unique_pct, hisat2_overall_alignment_pct) |>
+    inner_join(dplyr::select(star_map, sample, star_unique_pct = Uniquely_mapped_reads_pct,
+                             star_multi_pct = pct_of_reads_mapped_to_multiple_loci), by = "sample") |>
+    left_join(rownames_to_column(meta, "sample") |> dplyr::select(sample, tissue, run), by = "sample")
+
+  # 2. per-sample agreement of gene counts (kept genes, log2 CPM)
+  count_cmp <- map(TISSUES, \(t) {
+    g <- gene_qc[[t]]$keep
+    s <- rownames(aav_meta(t))
+    lc <- \(m) log2(t(t(m[g, s]) / colSums(m[g, s]) * 1e6) + 1)
+    h <- lc(geneCounts); st <- lc(altCounts)
+    tibble(sample = s, tissue = t,
+           r_log2cpm = map_dbl(s, \(x) cor(h[, x], st[, x])),
+           alt_over_primary_total = colSums(altCounts[g, s]) / colSums(geneCounts[g, s]))
+  }) |> bind_rows()
+  write_csv(full_join(map_cmp, count_cmp, by = c("sample", "tissue")),
+            file.path(CSV_DIR, "qc", "aligner_comparison_by_sample.csv"))
+
+  # 3. the full analysis rerun on the other aligner's counts (same genes / functions; swapped in,
+  #    then restored)
+  primary_counts <- geneCounts
+  geneCounts     <- altCounts
+  alt_fits   <- tibble(tissue = TISSUES) |> mutate(fit = map(tissue, run_deseq), de = map(fit, de_table))
+  geneCounts <- primary_counts
+  by_src <- list(fits, alt_fits) |> set_names(c(COUNT_SOURCE, ALT_SOURCE))
+  de_cmp <- map2(by_src$HISAT2$de, by_src$STAR$de, \(h, s)
+    full_join(dplyr::select(h, ensemblID, Symbol, lfc_hisat = log2FoldChange_shrunk, padj_hisat = padj),
+              dplyr::select(s, ensemblID, lfc_star = log2FoldChange_shrunk, padj_star = padj),
+              by = "ensemblID")) |>
+    set_names(TISSUES)
+  aligner_de <- imap(de_cmp, \(d, t) tibble(tissue = t,
+      sig_hisat = sum(d$padj_hisat < PADJ_CUT, na.rm = TRUE),
+      sig_star  = sum(d$padj_star  < PADJ_CUT, na.rm = TRUE),
+      sig_both  = sum(d$padj_hisat < PADJ_CUT & d$padj_star < PADJ_CUT, na.rm = TRUE),
+      r_shrunk_lfc = cor(d$lfc_hisat, d$lfc_star, use = "complete.obs"))) |> bind_rows()
+  iwalk(de_cmp, \(d, t) write_tsv(d, file.path(CSV_DIR, "deseq2",
+                                              sprintf("%s_DE_hisat2_vs_star.tsv", tolower(t)))))
+  write_csv(aligner_de, file.path(CSV_DIR, "deseq2", "aligner_DE_concordance.csv"))
+  print(aligner_de)
+  print(alt_fits |> transmute(tissue, alt_source = ALT_SOURCE, oos_run_DE_after_correction =
+          map_chr(fit, \(f) paste(map_int(f$check_oos, \(r) sum(r$padj < PADJ_CUT, na.rm = TRUE)),
+                                  collapse = ", "))))
+
+  p_map <- ggplot(map_cmp, aes(hisat2_concordant_unique_pct, star_unique_pct,
+                               colour = run, shape = tissue)) +
+    geom_abline(linewidth = 0.25, linetype = 2) +
+    geom_point(size = 1.2) +
+    scale_colour_manual(values = c(`2025-10` = "grey20", `2025-04` = "#E08214")) +
+    labs(x = "HISAT2 concordant unique (%)", y = "STAR uniquely mapped (%)",
+         colour = "Run", shape = NULL) +
+    theme_bulk()
+  p_cnt <- ggplot(count_cmp, aes(tissue, r_log2cpm)) +
+    geom_point(size = 1, position = position_jitter(width = 0.15, seed = 1)) +
+    labs(x = NULL, y = "Per-sample r, log2 CPM\n(htseq vs STAR counts)") + theme_bulk()
+  p_lfc <- imap(de_cmp, \(d, t) ggplot(d, aes(lfc_hisat, lfc_star)) +
+                  geom_abline(linewidth = 0.25, linetype = 2) +
+                  geom_point(size = 0.3, alpha = 0.4, stroke = 0) +
+                  labs(title = t, x = "Shrunken log2FC, HISAT2 + htseq",
+                       y = "Shrunken log2FC, STAR") + theme_bulk())
+  p_aligner <- (p_map + p_cnt) / wrap_plots(p_lfc, nrow = 1)
+  save_plot(p_aligner, file.path(FIG_DIR, "qc", "aligner_hisat2_vs_star"), "full", 140)
+  p_aligner
+}
+```
+
+###VALIDITY CHECKS (confound-resistant analyses)###
+
+Four standard checks on whether a Cre-vs-GFP signal could be technical:
+
+1.  **Replicate false-positive floor.** The bridge mice (same animal, both runs) are technical replicates, so every "DEG" between their two copies is a batch false positive. Any Cre effect no larger than this floor is indistinguishable from batch.
+2.  **RUVs** (Risso et al. 2014, *Nat Biotechnol*): unwanted-variation factors estimated from within-group (replicate) variation over empirical control genes, added to the model.
+3.  **EFAD E2/E2 vs E4/E4 benchmark.** The 12-month EFAD mice are all in the 2025-10 run, so their E2-vs-E4 contrast is free of the run confound. Whole-ranked-list agreement with the switch is tested by correlating Wald statistics and by GSEA of the EFAD E2-up / E2-down gene sets on the switch ranking (rather than overlapping thresholded DEG lists).
+4.  **Within-Cre dose-response.** Among Cre mice only, expression regressed on each mouse's liver APOE E2 allelic fraction (what Cre leaves behind). Batch cannot drive a within-group gradient. The E2 range is narrow (about 0.87-0.96), so each Cre mouse is also left out in turn and only genes that survive every refit are counted.
+
+```{r validity-checks, fig.width = 6.7, fig.height = 3}
+## 1. replicate false-positive floor -----------------------------------------------------------
+replicate_floor <- function(tissue) {
+  genes <- gene_qc[[tissue]]$keep
+  gm    <- gfp_meta(tissue, dedup = FALSE)      # replicate pairs needed here
+  pairs <- gm |> rownames_to_column("sample") |> group_by(mouse_id) |>
+    dplyr::filter(n_distinct(run) == 2) |> ungroup()
+  if (nrow(pairs) == 0) return(tibble(tissue = tissue, n_pairs = 0L))
+  # dispersions from all GFP of the tissue, so even one pair gives a valid test
+  dg <- DESeqDataSetFromMatrix(geneCounts[genes, rownames(gm)], gm, ~ sex + run) |>
+    norm_dds() |> estimateDispersions(quiet = TRUE)
+  pm <- gm[pairs$sample, , drop = FALSE] |> mutate(mouse_id = factor(mouse_id))
+  dp <- DESeqDataSetFromMatrix(geneCounts[genes, rownames(pm)], pm,
+                               if (nlevels(pm$mouse_id) > 1) ~ mouse_id + run else ~ run)
+  if (!is.null(normalizationFactors(dg))) {
+    normalizationFactors(dp) <- normalizationFactors(dg)[, colnames(dp), drop = FALSE]
+  } else sizeFactors(dp) <- sizeFactors(dg)[colnames(dp)]
+  dispersions(dp) <- dispersions(dg)
+  dp <- nbinomWaldTest(dp, quiet = TRUE)
+  r  <- results(dp, name = run_coef(dp), alpha = PADJ_CUT)
+  tibble(tissue = tissue, n_pairs = nlevels(pm$mouse_id),
+         fp_genes = list(rownames(r)[!is.na(r$padj) & r$padj < PADJ_CUT]),
+         replicate_FP_DEGs = sum(r$padj < PADJ_CUT, na.rm = TRUE),
+         replicate_FP_DEGs_abs_lfc_gt1 = sum(r$padj < PADJ_CUT & abs(r$log2FoldChange) > 1, na.rm = TRUE))
+}
+floor_tbl <- map(TISSUES, replicate_floor) |> bind_rows() |>
+  left_join(dplyr::select(de_summary, tissue, Cre_vs_GFP_DEGs = n_sig), by = "tissue")
+write_csv(dplyr::select(floor_tbl, -fp_genes),
+          file.path(CSV_DIR, "deseq2", "replicate_false_positive_floor.csv"))
+dplyr::select(floor_tbl, -fp_genes)
+
+## 2. RUVs --------------------------------------------------------------------------------------
+ruv_check <- function(tissue, k) {
+  dds <- fits$fit[[match(tissue, fits$tissue)]]$dds
+  m   <- as.data.frame(colData(dds))
+  # empirical negative controls: genes least associated with treatment in the primary fit
+  res <- fits$fit[[match(tissue, fits$tissue)]]$res
+  ctl <- rownames(res)[!is.na(res$pvalue) & res$pvalue > 0.5]
+  groups <- RUVSeq::makeGroups(m$treatment)
+  ruv <- RUVSeq::RUVs(counts(dds), cIdx = ctl, k = k, scIdx = groups, isLog = FALSE)
+  W   <- as.data.frame(ruv$W)
+  mw  <- cbind(m, W)
+  design_w <- reformulate(c(colnames(W), attr(terms(design(dds)), "term.labels")))
+  r <- DESeqDataSetFromMatrix(counts(dds), mw, design_w) |> norm_dds() |> DESeq(quiet = TRUE) |>
+    results(name = COEF, alpha = PADJ_CUT)
+  tibble(tissue = tissue, k = k, DEGs_RUVs = sum(r$padj < PADJ_CUT, na.rm = TRUE),
+         r_stat_vs_primary = cor(r$stat, res$stat, use = "complete.obs"),
+         W1_r_with_run = cor(W[[1]], as.numeric(factor(m$run))))
+}
+ruv_tbl <- expand_grid(tissue = TISSUES, k = 1:2) |> pmap(ruv_check) |> bind_rows()
+write_csv(ruv_tbl, file.path(CSV_DIR, "deseq2", "RUVs_sensitivity.csv"))
+ruv_tbl
+
+## 3. EFAD E2/E2 vs E4/E4 benchmark -------------------------------------------------------------
+efad_contrast <- function(tissue) {
+  em <- meta[meta$tissue == tissue & meta$arm == "APOE_EFAD" & meta$apoe %in% c("E2", "E4"), ,
+             drop = FALSE] |>
+    mutate(apoe = factor(apoe, levels = c("E4", "E2"))) |> droplevels()
+  des <- if (n_distinct(em[[BATCH]]) > 1) ~ extraction_batch + apoe else ~ apoe
+  DESeqDataSetFromMatrix(geneCounts[gene_qc[[tissue]]$keep, rownames(em)], em, des) |>
+    norm_dds() |> DESeq(quiet = TRUE) |> results(name = "apoe_E2_vs_E4", alpha = PADJ_CUT)
+}
+efad <- map(set_names(TISSUES), efad_contrast)
+
+benchmark <- imap(efad, \(e, t) {
+  sw   <- fits$fit[[match(t, fits$tissue)]]$res
+  both <- intersect(rownames(e)[!is.na(e$stat)], rownames(sw)[!is.na(sw$stat)])
+  # E2 signature: top 200 genes by EFAD Wald statistic in each direction
+  st   <- sort(set_names(e$stat, rownames(e))[both], decreasing = TRUE)
+  sets <- bind_rows(tibble(term = "EFAD_E2_up",   gene = head(names(st), 200)),
+                    tibble(term = "EFAD_E2_down", gene = tail(names(st), 200)))
+  ranks <- sort(set_names(sw$stat, rownames(sw))[both], decreasing = TRUE)
+  g <- clusterProfiler::GSEA(ranks, TERM2GENE = sets, pvalueCutoff = 1, minGSSize = 10,
+                             eps = 0, seed = TRUE, verbose = FALSE) |> as.data.frame()
+  tibble(tissue = t, n_genes = length(both),
+         EFAD_E2vsE4_DEGs = sum(e$padj < PADJ_CUT, na.rm = TRUE),
+         spearman_stat = cor(e[both, "stat"], sw[both, "stat"], method = "spearman"),
+         NES_E2_up   = g$NES[g$ID == "EFAD_E2_up"],   padj_E2_up   = g$p.adjust[g$ID == "EFAD_E2_up"],
+         NES_E2_down = g$NES[g$ID == "EFAD_E2_down"], padj_E2_down = g$p.adjust[g$ID == "EFAD_E2_down"])
+}) |> bind_rows()
+write_csv(benchmark, file.path(CSV_DIR, "deseq2", "EFAD_E2vsE4_benchmark.csv"))
+benchmark   # if the switch is E2-like: spearman > 0, NES_E2_up > 0, NES_E2_down < 0
+
+## 4. within-Cre dose-response to the liver E2 allelic fraction -------------------------------
+e2_by_mouse <- apoe_calls |>
+  left_join(rownames_to_column(meta, "sample") |> dplyr::select(sample, mouse_id, tissue, treatment),
+            by = "sample") |>
+  dplyr::filter(tissue == "Liver", treatment == "Cre") |>
+  dplyr::select(mouse_id, e2_frac = rs7412_T_frac)
+
+dose_response <- function(tissue) {
+  cm <- aav_meta(tissue) |> rownames_to_column("sample") |>
+    dplyr::filter(treatment == "Cre", run == CRE_RUN) |>
+    left_join(e2_by_mouse, by = "mouse_id") |> dplyr::filter(!is.na(e2_frac)) |>
+    column_to_rownames("sample") |> mutate(e2_frac_c = (e2_frac - mean(e2_frac)) / sd(e2_frac))
+  fit_dose <- function(m) {
+    m$e2_frac_c <- as.numeric(scale(m$e2_frac))
+    DESeqDataSetFromMatrix(geneCounts[gene_qc[[tissue]]$keep, rownames(m)], m, ~ sex + e2_frac_c) |>
+      norm_dds() |> DESeq(quiet = TRUE) |> results(name = "e2_frac_c", alpha = PADJ_CUT)
+  }
+  r  <- fit_dose(cm)
+  # leverage: the E2 range is narrow, so one mouse can create a "gradient". Refit leaving out each
+  # Cre mouse; a dose gene counts only if it stays significant, same sign, in every refit.
+  sig  <- !is.na(r$padj) & r$padj < PADJ_CUT
+  loo  <- map(rownames(cm), \(x) fit_dose(cm[rownames(cm) != x, , drop = FALSE]))
+  keep <- purrr::reduce(map(loo, \(l) !is.na(l$padj) & l$padj < PADJ_CUT &
+                                  sign(l$log2FoldChange) == sign(r$log2FoldChange)), `&`, .init = sig)
+  sw <- fits$fit[[match(tissue, fits$tissue)]]$res
+  both <- intersect(rownames(r)[!is.na(r$stat)], rownames(sw)[!is.na(sw$stat)])
+  tibble(tissue = tissue, n_cre = nrow(cm),
+         e2_range = sprintf("%.2f-%.2f", min(cm$e2_frac), max(cm$e2_frac)),
+         dose_DEGs = sum(sig),
+         dose_DEGs_robust_to_any_one_mouse = sum(keep),
+         most_influential_mouse = rownames(cm)[which.min(map_int(loo, \(l) sum(l$padj < PADJ_CUT, na.rm = TRUE)))],
+         spearman_with_Cre_vs_GFP = cor(r[both, "stat"], sw[both, "stat"], method = "spearman"))
+}
+dose_tbl <- map(TISSUES, dose_response) |> bind_rows()
+write_csv(dose_tbl, file.path(CSV_DIR, "deseq2", "within_Cre_dose_response.csv"))
+dose_tbl
+```
+
+###SWITCH vs GERMLINE APOE (EFAD E2 / E3 / E4)###
+
+The EFAD mice carry human APOE E2, E3 or E4 for life (12 months, 5xFAD het, male). They were sequenced in the same 2025-10 run as the switch mice, so comparisons among these samples have no run confound. Three questions:
+
+1.  **Germline contrasts** (E2 vs E3, E3 vs E4, E2 vs E4): which of them does the switch (Cre vs GFP) resemble? If the reversed liver signature tracks APOE genotype, the switch should relate the same way to E2 vs E3 and E3 vs E4; if it is specific to one line (genetic background), only contrasts involving that line will show it.
+2.  **Direct comparison**: switch Cre and switch GFP vs germline E2/E2 and E4/E4 in one model (~ sex [+ extraction batch] + group). Switch GFP (still E4 in liver) vs germline E4 is the reference for how much the two models differ before any switch (AAV, age at start, sex mix, colony).
+3.  **E2-likeness score**: each sample's position on the germline E2-vs-E4 axis (mean z of the top-200 E2-up genes minus the top-200 E2-down genes, variance-stabilised data). The EFAD E2 and E4 mice define the axis, so their own scores are optimistic; the switch mice are scored out-of-sample.
+
+```{r switch-vs-germline, fig.width = 6.7, fig.height = 3}
+cur_meta <- function(tissue)
+  meta[meta$tissue == tissue & meta$run == CRE_RUN, , drop = FALSE] |>
+  rownames_to_column("sample") |>
+  mutate(group = case_when(arm == "AAV" ~ paste("Switch", treatment),
+                           TRUE ~ paste("EFAD", apoe))) |>
+  column_to_rownames("sample") |>
+  mutate(group = factor(group, levels = c("Switch GFP", "Switch Cre", "EFAD E2", "EFAD E3", "EFAD E4")))
+
+# include extraction batch only if every batch level holds more than one group
+batch_ok <- function(m) n_distinct(m[[BATCH]]) > 1 &&
+  all(tapply(m$group, droplevels(m[[BATCH]]), \(x) n_distinct(x) > 1))
+
+## 1. germline contrasts vs the switch ---------------------------------------------------------
+germline_contrast <- function(tissue, a, b) {
+  em <- cur_meta(tissue) |> dplyr::filter(group %in% paste("EFAD", c(a, b))) |>
+    mutate(group = factor(group, levels = paste("EFAD", c(b, a)))) |> droplevels()
+  des <- if (batch_ok(em)) ~ extraction_batch + group else ~ group
+  DESeqDataSetFromMatrix(geneCounts[gene_qc[[tissue]]$keep, rownames(em)], em, des) |>
+    norm_dds() |> DESeq(quiet = TRUE) |> results(contrast = c("group", paste("EFAD", a), paste("EFAD", b)),
+                                   alpha = PADJ_CUT)
+}
+relate <- function(e, sw, label, tissue) {
+  both <- intersect(rownames(e)[!is.na(e$stat)], rownames(sw)[!is.na(sw$stat)])
+  st   <- sort(set_names(e$stat, rownames(e))[both], decreasing = TRUE)
+  sets <- bind_rows(tibble(term = "up", gene = head(names(st), 200)),
+                    tibble(term = "down", gene = tail(names(st), 200)))
+  g <- clusterProfiler::GSEA(sort(set_names(sw$stat, rownames(sw))[both], decreasing = TRUE),
+                             TERM2GENE = sets, pvalueCutoff = 1, minGSSize = 10, eps = 0,
+                             seed = TRUE, verbose = FALSE) |> as.data.frame()
+  tibble(tissue = tissue, germline = label,
+         germline_DEGs = sum(e$padj < PADJ_CUT, na.rm = TRUE),
+         spearman_with_switch = cor(e[both, "stat"], sw[both, "stat"], method = "spearman"),
+         NES_up = g$NES[g$ID == "up"], padj_up = g$p.adjust[g$ID == "up"],
+         NES_down = g$NES[g$ID == "down"], padj_down = g$p.adjust[g$ID == "down"])
+}
+germ_pairs <- tribble(~a, ~b, "E2", "E4", "E2", "E3", "E3", "E4")
+germline <- expand_grid(tissue = TISSUES, germ_pairs) |>
+  mutate(res = pmap(list(tissue, a, b), germline_contrast))
+germline_tbl <- pmap(list(germline$res, germline$tissue, germline$a, germline$b), \(e, t, a, b)
+  relate(e, fits$fit[[match(t, fits$tissue)]]$res, paste(a, "vs", b), t)) |> bind_rows()
+write_csv(germline_tbl, file.path(CSV_DIR, "deseq2", "switch_vs_germline_contrasts.csv"))
+germline_tbl   # switch E2-like => spearman > 0, NES_up > 0 for the "E2 vs .." / "E3 vs E4" rows
+
+## 2. direct comparison: switch groups vs germline E2 / E4 ------------------------------------
+direct <- map(set_names(TISSUES), \(t) {
+  dm  <- cur_meta(t) |> dplyr::filter(group != "EFAD E3") |> droplevels()
+  des <- if (batch_ok(dm)) ~ sex + extraction_batch + group else ~ sex + group
+  dds <- DESeqDataSetFromMatrix(geneCounts[gene_qc[[t]]$keep, rownames(dm)], dm, des) |>
+    norm_dds() |> DESeq(quiet = TRUE)
+  cmp <- list(c("Switch Cre", "EFAD E2"), c("Switch Cre", "EFAD E4"),
+              c("Switch GFP", "EFAD E4"), c("Switch GFP", "EFAD E2"))
+  map(cmp, \(k) {
+    r <- results(dds, contrast = c("group", k), alpha = PADJ_CUT)
+    tibble(tissue = t, comparison = paste(k, collapse = " vs "),
+           design = paste(deparse(des), collapse = ""),
+           DEGs = sum(r$padj < PADJ_CUT, na.rm = TRUE),
+           DEGs_abs_lfc_gt1 = sum(r$padj < PADJ_CUT & abs(r$log2FoldChange) > 1, na.rm = TRUE))
+  }) |> bind_rows()
+}) |> bind_rows()
+write_csv(direct, file.path(CSV_DIR, "deseq2", "switch_vs_germline_direct.csv"))
+direct   # Cre closer to germline E2 than GFP is => fewer Cre-vs-E2 than GFP-vs-E2 DEGs
+
+## 3. E2-likeness score -----------------------------------------------------------------------
+e2_axis <- germline |> dplyr::filter(a == "E2", b == "E4")
+scores <- map2(e2_axis$tissue, e2_axis$res, \(t, e) {
+  sm  <- cur_meta(t) |> droplevels()
+  vs  <- DESeqDataSetFromMatrix(geneCounts[gene_qc[[t]]$keep, rownames(sm)], sm, ~ 1) |>
+    vst(blind = TRUE) |> assay()
+  st  <- sort(set_names(e$stat, rownames(e))[!is.na(e$stat)], decreasing = TRUE)
+  z   <- t(scale(t(vs)))
+  tibble(sample = colnames(vs), tissue = t, group = sm$group, sex = sm$sex,
+         e2_likeness = colMeans(z[head(names(st), 200), ]) - colMeans(z[tail(names(st), 200), ]))
+}) |> bind_rows()
+write_csv(scores, file.path(CSV_DIR, "deseq2", "E2_likeness_scores.csv"))
+scores |> group_by(tissue, group) |>
+  summarise(n = n(), mean_score = mean(e2_likeness), sd = sd(e2_likeness), .groups = "drop")
+
+p_e2 <- ggplot(scores, aes(group, e2_likeness)) +
+  geom_hline(yintercept = 0, linewidth = 0.25, linetype = 2) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.3, width = 0.6, colour = "grey40") +
+  geom_point(aes(shape = sex), size = 0.9, position = position_jitter(width = 0.15, seed = 1)) +
+  facet_wrap(~ tissue) +
+  scale_shape_manual(values = c(Female = 1, Male = 16)) +
+  labs(x = NULL, y = "Germline E2-likeness score\n(E2-up minus E2-down, mean z)", shape = NULL) +
+  theme_bulk() + theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "top")
+save_plot(p_e2, file.path(FIG_DIR, "deseq2", "E2_likeness_switch_vs_germline"), "full", 75)
+p_e2
+```
+
+###BATCH-CORRECTION BENCHMARK (bridge controls held out)###
+
+Question: with Cre (2025-10 run) and GFP (2025-04 run) sequenced in different runs, which correction removes the run effect while keeping Cre biology? Each method is fitted on a fully run-confounded set, and graded only on samples it never saw.
+
+- **Model set**: 2025-10 Cre (10) vs 2025-04 GFP from mice sequenced only once (8; the double-run mice SAD_326 and MAD_271 are left out entirely). The 2025-04 Cre samples are not used: they were different, misgenotyped mice.
+- **Held-out validation**: the double-run mice (same animal in both runs = pure run effect), SAD_532 (2025-10 GFP, single run), and the 2025-10-only Cre vs GFP comparison (no run confound).
+
+Methods:
+
+- `none`: ~ sex + treatment (the run-confounded comparison).
+- `RUVg_HK_k`: RUVg (Risso et al. 2014) with *a priori* negative controls = mouse orthologues of the Eisenberg & Levanon (2013) human housekeeping genes; k = 1-3 factors added to the model.
+- `tech_cov`: per-sample technical covariate (STAR uniquely-mapped %), slope estimated within group because treatment is in the model.
+- `cqn`: conditional quantile normalisation of gene GC content and length (Hansen et al. 2012) as DESeq2 normalisation factors.
+- `cqn_RUVg_HK_1`: both.
+- `bridge_offset`: the full run correction estimated from the double-run mice (reference only; it uses the held-out samples, so its bridge score is circular).
+
+Scores (per tissue):
+
+- **bridge_genes_2fold**: genes differing > 2-fold between the two copies of the same mouse after correction (lower = more batch removed).
+- **SAD532_cre_likeness**: correlation of SAD_532's deviation from the 2025-04 GFP mean with the Cre-vs-GFP difference. SAD_532 is a GFP mouse in the Cre run, so > 0 means run effect left over.
+- **run_aligned_pct**: % of the method's DEGs whose direction matches the same-mouse run difference (50% = chance; 90%+ = DEGs are run).
+- **r_with_within_run**: Spearman of the method's Cre-vs-GFP statistic with the 2025-10-only statistic (unconfounded; higher = more of the true Cre signal kept). Both use the same Cre mice, which raises every method's value equally.
+
+```{r batch-benchmark, fig.width = 6.7, fig.height = 4}
+hk_human <- read_tsv(file.path(IN_DIR, "reference", "HK_genes_Eisenberg2013.txt"),
+                     col_names = c("symbol", "refseq"), show_col_types = FALSE) |>
+  mutate(symbol = str_trim(symbol)) |> pull(symbol) |> unique()
+hk_mouse <- babelgene::orthologs(genes = hk_human, species = "mouse", human = TRUE) |>
+  dplyr::filter(support_n >= 3) |> pull(ensembl) |> unique()
+gcl_file <- file.path(IN_DIR, "mcc_results", "gene_gc_length.tsv")
+star_map_bm <- read_tsv(file.path(IN_DIR, "mcc_results", "star_mapping_summary.tsv"),
+                        show_col_types = FALSE)
+
+bench_tissue <- function(tissue) {
+  genes <- gene_qc[[tissue]]$keep
+  aav   <- aav_meta(tissue, dedup = FALSE) |> rownames_to_column("sample")
+  double_mice <- aav |> dplyr::filter(treatment == "GFP") |> group_by(mouse_id) |>
+    dplyr::filter(n_distinct(run) == 2) |> pull(mouse_id) |> unique()
+  # SAD_326's 2025-10 brain (B13) is excluded, so in brain it no longer has two runs; it is still a
+  # double-run mouse, so its 2025-04 copy stays out of the model set
+  double_mice <- union(double_mice, c("SAD_326", "MAD_271"))
+  model <- aav |> dplyr::filter(!mouse_id %in% double_mice,
+                                (treatment == "Cre" & run == CRE_RUN) | (treatment == "GFP" & run == GFP_RUN))
+  bridges <- aav |> dplyr::filter(mouse_id %in% double_mice) |> group_by(mouse_id) |>
+    dplyr::filter(n_distinct(run) == 2) |> ungroup()
+  s532  <- aav |> dplyr::filter(treatment == "GFP", run == CRE_RUN, !mouse_id %in% double_mice) |> pull(sample)
+  all_s <- unique(c(model$sample, bridges$sample, s532))
+  am    <- aav_meta(tissue, dedup = FALSE)[all_s, , drop = FALSE] |> droplevels()
+  am$uniq <- as.numeric(scale(star_map_bm$Uniquely_mapped_reads_pct[match(all_s, star_map_bm$sample)]))
+  cts   <- geneCounts[genes, all_s]
+  mm    <- am[model$sample, , drop = FALSE] |> droplevels()
+  # common normalised log scale for all samples
+  sf    <- estimateSizeFactorsForMatrix(cts)
+  Y     <- log2(t(t(cts) / sf) + 1)
+
+  # same-mouse run difference (2025-10 minus 2025-04), averaged over bridge mice
+  run_diff <- bridges |> split(~ mouse_id) |>
+    map(\(b) Y[, b$sample[b$run == CRE_RUN]] - Y[, b$sample[b$run == GFP_RUN]]) |>
+    purrr::reduce(`+`) / n_distinct(bridges$mouse_id)
+
+  # nuisance-corrected log values for ALL samples: coefficients from the model set (treatment and
+  # sex protected), applied to every sample
+  regress_out <- function(Z) {
+    X  <- model.matrix(~ sex + treatment, mm)
+    D  <- cbind(X, Z[model$sample, , drop = FALSE])
+    B  <- limma::lmFit(Y[, model$sample], D)$coefficients[, colnames(Z), drop = FALSE]
+    Y - B %*% t(Z[colnames(Y), , drop = FALSE])
+  }
+  deseq <- function(m, des, nf = NULL) {
+    d <- DESeqDataSetFromMatrix(cts[, rownames(m)], m, des)
+    if (!is.null(nf)) normalizationFactors(d) <- nf[, rownames(m)] / exp(rowMeans(log(nf[, rownames(m)])))
+    results(DESeq(d, quiet = TRUE), name = COEF, alpha = PADJ_CUT)
+  }
+  ruv_W <- function(k, x = cts) {
+    ctl <- intersect(hk_mouse, rownames(x))
+    W <- RUVSeq::RUVg(x, cIdx = ctl, k = k, isLog = FALSE)$W
+    rownames(W) <- colnames(x); colnames(W) <- paste0("W_", seq_len(k)); W
+  }
+  methods <- list()
+  methods$none <- list(res = deseq(mm, ~ sex + treatment), Yc = Y)
+  for_k <- map(1:3, \(k) {
+    W  <- ruv_W(k); mw <- cbind(mm, W[rownames(mm), , drop = FALSE])
+    list(res = deseq(mw, reformulate(c(colnames(W), "sex", "treatment"))), Yc = regress_out(W))
+  }) |> set_names(paste0("RUVg_HK_", 1:3))
+  methods <- c(methods, for_k)
+  Zt <- matrix(am$uniq, dimnames = list(rownames(am), "uniq"))
+  methods$tech_cov <- list(res = deseq(mm |> mutate(uniq = am[rownames(mm), "uniq"]), ~ uniq + sex + treatment),
+                           Yc = regress_out(Zt))
+  if (file.exists(gcl_file)) {
+    gcl <- read_tsv(gcl_file, show_col_types = FALSE)
+    gi  <- match(genes, gcl$GeneID)
+    cq  <- cqn::cqn(cts, x = gcl$gc[gi], lengths = gcl$length[gi], sizeFactors = colSums(cts),
+                    verbose = FALSE)
+    nf  <- exp(cq$glm.offset)
+    Ycq <- cq$y + cq$offset
+    methods$cqn <- list(res = deseq(mm, ~ sex + treatment, nf = nf), Yc = Ycq)
+    W1  <- ruv_W(1)
+    mw  <- cbind(mm, W1[rownames(mm), , drop = FALSE])
+    Y_bak <- Y; Y <- Ycq; Yc <- regress_out(W1); Y <- Y_bak
+    methods$cqn_RUVg_HK_1 <- list(res = deseq(mw, ~ W_1 + sex + treatment, nf = nf), Yc = Yc)
+  }
+  # reference: full run offset from the double-run mice (circular on the bridge score)
+  off <- rowMeans(as.matrix(run_diff))
+  nf_b <- matrix(1, nrow(cts), ncol(cts), dimnames = dimnames(cts))
+  nf_b[, am$run == GFP_RUN] <- 2^(-off)
+  nf_b <- t(t(nf_b) * sf)
+  Yb <- Y; Yb[, am$run == GFP_RUN] <- Yb[, am$run == GFP_RUN] + off
+  methods$bridge_offset <- list(res = deseq(mm, ~ sex + treatment, nf = nf_b), Yc = Yb)
+
+  within <- fits$fit[[match(tissue, fits$tissue)]]$within
+  gfp_m  <- model$sample[model$treatment == "GFP"]; cre_m <- model$sample[model$treatment == "Cre"]
+  imap(methods, \(m, nm) {
+    r   <- m$res; sig <- which(r$padj < PADJ_CUT)
+    Yc  <- m$Yc
+    pair_genes <- bridges |> split(~ mouse_id) |>
+      map_dbl(\(b) sum(abs(Yc[, b$sample[b$run == CRE_RUN]] - Yc[, b$sample[b$run == GFP_RUN]]) > 1))
+    cre_sig <- rowMeans(Yc[, cre_m]) - rowMeans(Yc[, gfp_m])
+    s532_dev <- if (length(s532)) Yc[, s532[1]] - rowMeans(Yc[, gfp_m]) else NA
+    both <- intersect(rownames(r)[!is.na(r$stat)], rownames(within)[!is.na(within$stat)])
+    tibble(tissue = tissue, method = nm, DEGs = length(sig),
+           run_aligned_pct = if (length(sig)) 100 * mean(sign(r$log2FoldChange[sig]) == sign(run_diff[sig])) else NA_real_,
+           bridge_genes_2fold = mean(pair_genes),
+           SAD532_cre_likeness = if (length(s532)) cor(s532_dev, cre_sig) else NA_real_,
+           r_with_within_run = cor(r[both, "stat"], within[both, "stat"], method = "spearman"),
+           n_model = nrow(mm), n_bridge_mice = n_distinct(bridges$mouse_id))
+  }) |> bind_rows()
+}
+benchmark_tbl <- map(TISSUES, bench_tissue) |> bind_rows() |>
+  mutate(method = factor(method, levels = unique(method)))
+write_csv(benchmark_tbl, file.path(CSV_DIR, "deseq2", "batch_correction_benchmark.csv"))
+benchmark_tbl
+
+p_bench <- benchmark_tbl |>
+  dplyr::select(tissue, method, `Bridge genes >2-fold\n(lower = batch removed)` = bridge_genes_2fold,
+                `SAD_532 Cre-likeness\n(0 = batch removed)` = SAD532_cre_likeness,
+                `Agreement with 2025-10-only\n(higher = biology kept)` = r_with_within_run) |>
+  pivot_longer(-c(tissue, method), names_to = "score", values_to = "value") |>
+  ggplot(aes(value, method, colour = tissue)) +
+  geom_point(size = 1.4) +
+  facet_wrap(~ score, scales = "free_x") +
+  scale_colour_manual(values = c(Liver = "#8C510A", Brain = "#01665E")) +
+  labs(x = NULL, y = NULL, colour = NULL) +
+  theme_bulk() + theme(legend.position = "top")
+save_plot(p_bench, file.path(FIG_DIR, "deseq2", "batch_correction_benchmark"), "full", 85)
+p_bench
+```
+
+```{r shrinkage-check, fig.width = 6.7, fig.height = 2.6}
+# Tutorial: log2FC distribution before vs after apeglm shrinkage
+p_shrink <- fits |>
+  transmute(tissue, d = map(de, \(d) d |>
+                               dplyr::select(before = log2FoldChange, after = log2FoldChange_shrunk) |>
+                               pivot_longer(everything(), names_to = "shrinkage", values_to = "lfc"))) |>
+  unnest(d) |>
+  mutate(shrinkage = factor(shrinkage, levels = c("before", "after"))) |>
+  ggplot(aes(lfc, colour = shrinkage)) +
+  geom_density(linewidth = 0.4, na.rm = TRUE) +
+  facet_wrap(~ tissue) +
+  coord_cartesian(xlim = c(-3, 3)) +
+  scale_colour_manual(values = c(before = "grey50", after = "black")) +
+  labs(x = "log2 fold change (Cre / GFP)", y = "Density", colour = "LFC shrinkage") +
+  theme_bulk()
+save_plot(p_shrink, file.path(FIG_DIR, "deseq2", "before_after_shrinkage"), "full", 55)
+p_shrink
+```
+
+###CANDIDATE PATHWAYS###
+
+Pathways that come up in the liver GSEA (Cre vs GFP) but rest on few controls: OXPHOS up, ribosome biogenesis up, cell-substrate adhesion down, negative regulation of immune response down. They fail the strict leave-one-out significance test (dropping one 2025-10 GFP mouse lifts padj above 0.05) while keeping their direction, so they are followed up here without the 2025-04 samples at all:
+
+- per-sample pathway scores (mean z, variance-stabilised counts) in **2025-10-run livers only**: 10 Cre, 3 GFP and 9 EFAD (E2 / E3 / E4), one sample per mouse, no run confound;
+- Cre vs the switch GFP mice (same colony and run; Welch t-test), and, as a secondary reference, vs all other 2025-10 livers including EFAD (Wilcoxon, with each GFP left out);
+- technical flag: correlation of each score with STAR uniquely-mapped % within the Cre group;
+- immune term: is it a regulation change or a Kupffer / leukocyte composition change?
+
+The EFAD mice are a different colony (male, 12 months) and were not designed as controls for the switch, so they widen the reference but are not matched to it. These pathways were found in this data, so this is support, not independent replication.
+
+```{r candidate-pathways, fig.width = 6.7, fig.height = 5}
+go_members <- function(go) unique(suppressMessages(
+  AnnotationDbi::select(org.Mm.eg.db, go, "ENSEMBL", "GOALL"))$ENSEMBL)
+mt_ids <- id2name$ensemblID[str_detect(replace_na(id2name$Symbol, ""), "^mt-")]
+candidate_sets <- imap(CANDIDATE_TERMS, \(go, nm) {
+  g <- go_members(go)
+  if (str_detect(nm, "OXPHOS")) setdiff(g, mt_ids) else g
+})
+candidate_sets[["OXPHOS (mito-encoded; technical flag)"]] <- intersect(go_members(CANDIDATE_TERMS[[1]]), mt_ids)
+
+score_tissue <- function(tissue) {
+  sm <- meta[meta$tissue == tissue & meta$run == CRE_RUN, , drop = FALSE] |>
+    rownames_to_column("sample") |>
+    mutate(group = if_else(arm == "AAV", paste("Switch", treatment), paste("EFAD", apoe)),
+           group = factor(group, levels = c("Switch GFP", "Switch Cre", "EFAD E2", "EFAD E3", "EFAD E4"))) |>
+    column_to_rownames("sample")
+  genes <- gene_qc[[tissue]]$keep
+  vs <- DESeqDataSetFromMatrix(geneCounts[genes, rownames(sm)], sm, ~ 1) |> norm_dds() |>
+    vst(blind = TRUE) |> assay()
+  z  <- t(scale(t(vs)))
+  map_dfc(candidate_sets, \(g) colMeans(z[intersect(g, rownames(z)), , drop = FALSE])) |>
+    mutate(sample = colnames(z), tissue = tissue, group = sm$group, sex = sm$sex,
+           immune_markers = colMeans(z[intersect(id2name$ensemblID[id2name$Symbol %in% IMMUNE_MARKERS],
+                                                 rownames(z)), , drop = FALSE]), .before = 1)
+}
+star_unique <- read_tsv(file.path(IN_DIR, "mcc_results", "star_mapping_summary.tsv"), show_col_types = FALSE) |>
+  dplyr::select(sample, star_unique_pct = Uniquely_mapped_reads_pct)
+cand_scores <- map(TISSUES, score_tissue) |> bind_rows() |> left_join(star_unique, by = "sample")
+write_csv(cand_scores, file.path(CSV_DIR, "deseq2", "candidate_pathway_scores.csv"))
+
+score_cols <- names(candidate_sets)
+cand_stats <- expand_grid(tissue = TISSUES, pathway = c(score_cols, "immune_markers")) |>
+  pmap(\(tissue, pathway) {
+    d <- dplyr::filter(cand_scores, tissue == !!tissue)
+    cre <- d$group == "Switch Cre"
+    gfp <- d$sample[d$group == "Switch GFP"]
+    loo_p <- map_dbl(gfp, \(x) wilcox.test(d[[pathway]][cre], d[[pathway]][!cre & d$sample != x])$p.value)
+    gfpv <- d[[pathway]][d$group == "Switch GFP"]
+    tibble(tissue, pathway,
+           cre_mean = mean(d[[pathway]][cre]), gfp_mean = mean(gfpv),
+           efad_E2 = mean(d[[pathway]][d$group == "EFAD E2"]), efad_E3 = mean(d[[pathway]][d$group == "EFAD E3"]),
+           efad_E4 = mean(d[[pathway]][d$group == "EFAD E4"]),
+           # primary: Cre vs the switch GFP mice (same colony, same run); t-test, n = 10 vs 3 (brain 2)
+           p_cre_vs_gfp = t.test(d[[pathway]][cre], gfpv)$p.value,
+           # secondary: vs all other 2025-10 livers (EFAD = different colony, so colony can contribute)
+           p_cre_vs_all_other = wilcox.test(d[[pathway]][cre], d[[pathway]][!cre])$p.value,
+           p_vs_all_other_worst_loo_gfp = max(loo_p),
+           r_with_star_unique_in_cre = cor(d[[pathway]][cre], d$star_unique_pct[cre]))
+  }) |> bind_rows()
+write_csv(cand_stats, file.path(CSV_DIR, "deseq2", "candidate_pathway_stats.csv"))
+cand_stats |> mutate(across(where(is.numeric), \(x) signif(x, 2)))
+
+# immune term: do its genes move with Kupffer / leukocyte abundance?
+cand_scores |> group_by(tissue) |>
+  summarise(r_immune_term_vs_immune_markers = cor(`Neg. reg. immune response`, immune_markers), .groups = "drop")
+
+p_cand <- cand_scores |>
+  pivot_longer(all_of(c(score_cols, "immune_markers")), names_to = "pathway", values_to = "score") |>
+  mutate(pathway = factor(pathway, levels = c(score_cols, "immune_markers"))) |>
+  ggplot(aes(group, score)) +
+  geom_hline(yintercept = 0, linewidth = 0.25, linetype = 2) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.3, width = 0.6, colour = "grey40") +
+  geom_point(aes(shape = sex), size = 0.8, position = position_jitter(width = 0.15, seed = 1)) +
+  facet_grid(tissue ~ pathway, labeller = label_wrap_gen(14)) +
+  scale_shape_manual(values = c(Female = 1, Male = 16)) +
+  labs(x = NULL, y = "Pathway score (mean z)", shape = NULL) +
+  theme_bulk() + theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "top")
+save_plot(p_cand, file.path(FIG_DIR, "deseq2", "candidate_pathway_scores"), "full", 125)
+p_cand
+```
+
+###CANDIDATE GENES (same checks, gene by gene)###
+
+The candidate-pathway checks applied to every gene, to see whether any single gene could survive the batching and be worth following up. Each gene is tested in the **2025-10 run only**, so the run cannot drive it: Cre vs the switch GFP mice, in a model that also holds the 2025-10 EFAD mice (~ sex [+ extraction batch] + group, group = Cre / GFP / EFAD E2 / E3 / E4). The EFAD mice only add to the dispersion estimates; they are never the comparison, because they differ from the switch colony (male, 12 months, different line) and would make colony look like Cre. Each gene is then checked against:
+
+1.  **Leave-one-GFP-out**: still padj < 0.05, same direction, with each 2025-10 GFP mouse removed.
+2.  **Main model**: same direction in the batch-corrected Cre vs GFP model (all controls).
+3.  **Not a replicate false positive**: not different between the two runs of the same mouse.
+4.  **Not tracking library quality**: |r| < 0.6 with STAR uniquely-mapped % within the Cre mice.
+
+**Tier 1** = passes everything; **Tier 2** = significant in the 2025-10 test with the right direction in check 2, but fails leave-one-out or a technical flag. **Brain is the negative control**: the AAV-TBG switch acts in hepatocytes, so the number of brain genes that pass is an estimate of how many liver hits the pipeline lets through by chance or artifact.
+
+```{r candidate-genes}
+candidate_gene_tissue <- function(tissue) {
+  genes <- gene_qc[[tissue]]$keep
+  om <- meta[meta$tissue == tissue & meta$run == CRE_RUN, , drop = FALSE] |>
+    mutate(group = factor(if_else(arm == "AAV", paste0("Switch_", treatment),
+                                  paste0("EFAD_", apoe)),
+                          levels = c("Switch_GFP", "Switch_Cre", "EFAD_E2", "EFAD_E3", "EFAD_E4")),
+           cre = group)
+  des_for <- function(m) if (n_distinct(m[[BATCH]]) > 1 &&
+                             all(tapply(m$group, droplevels(m[[BATCH]]), \(x) n_distinct(x) > 1)))
+    ~ sex + extraction_batch + group else ~ sex + group
+  fit_oct <- function(m) DESeqDataSetFromMatrix(geneCounts[genes, rownames(m)], m, des_for(m)) |>
+    norm_dds() |> DESeq(quiet = TRUE) |>
+    results(contrast = c("group", "Switch_Cre", "Switch_GFP"), alpha = PADJ_CUT)
+  r   <- fit_oct(om)
+  gfp <- rownames(om)[om$arm == "AAV" & om$treatment == "GFP"]
+  loo <- map(gfp, \(x) fit_oct(om[rownames(om) != x, , drop = FALSE] |> droplevels()))
+  loo_ok <- purrr::reduce(map(loo, \(l) !is.na(l$padj) & l$padj < PADJ_CUT &
+                                         sign(l$log2FoldChange) == sign(r$log2FoldChange)), `&`)
+  main   <- fits$fit[[match(tissue, fits$tissue)]]
+  # library-quality tracking within the Cre mice (normalised log counts vs STAR unique %)
+  cre_s <- rownames(om)[om$group == "Switch_Cre"]
+  lc <- log2(counts(norm_dds(DESeqDataSetFromMatrix(geneCounts[genes, cre_s], om[cre_s, ], ~ 1)),
+                    normalized = TRUE) + 1)
+  uq <- star_unique$star_unique_pct[match(cre_s, star_unique$sample)]
+  r_tech <- apply(lc, 1, \(x) suppressWarnings(cor(x, uq)))
+  fp <- floor_tbl$fp_genes[[match(tissue, floor_tbl$tissue)]] %||% character()
+  tibble(ensemblID = rownames(r), tissue = tissue,
+         log2FC_oct = r$log2FoldChange, padj_oct = r$padj,
+         loo_ok = loo_ok,
+         log2FC_main = main$res[rownames(r), "log2FoldChange"], padj_main = main$res[rownames(r), "padj"],
+
+         replicate_fp = ensemblID %in% fp,
+         r_with_lib_quality = r_tech[rownames(r)]) |>
+    mutate(sig_oct = !is.na(padj_oct) & padj_oct < PADJ_CUT,
+           agree_main = sign(log2FC_main) == sign(log2FC_oct),
+           tech_ok = !replicate_fp & abs(r_with_lib_quality) < 0.6,
+           tier = case_when(sig_oct & agree_main %in% TRUE & loo_ok & tech_ok ~ "Tier 1",
+                            sig_oct & agree_main %in% TRUE ~ "Tier 2",
+                            TRUE ~ NA_character_)) |>
+    left_join(dplyr::select(id2name, ensemblID, Symbol, biotype), by = "ensemblID") |>
+    left_join(cand_member, by = "ensemblID") |>
+    relocate(tissue, ensemblID, Symbol, tier)
+}
+cand_member <- imap(candidate_sets[names(CANDIDATE_TERMS)], \(g, nm) tibble(ensemblID = g, pathway = nm)) |>
+  bind_rows() |> dplyr::distinct(ensemblID, .keep_all = TRUE)
+cand_genes_all <- map(TISSUES, candidate_gene_tissue) |> bind_rows()
+cand_genes <- cand_genes_all |> dplyr::filter(!is.na(tier)) |> arrange(tissue, tier, padj_oct)
+write_csv(cand_genes, file.path(CSV_DIR, "deseq2", "candidate_genes.csv"))
+
+cand_genes_all |> group_by(tissue) |>
+  summarise(sig_2025_10_test = sum(sig_oct), tier1 = sum(tier == "Tier 1", na.rm = TRUE),
+            tier2 = sum(tier == "Tier 2", na.rm = TRUE), .groups = "drop")
+cand_genes |> dplyr::select(tissue, tier, Symbol, log2FC_oct, padj_oct, padj_main, loo_ok,
+                            replicate_fp, r_with_lib_quality, pathway) |>
+  mutate(across(where(is.numeric), \(x) signif(x, 2)))
+```
+
+###DE VISUALIZATION (tutorial: DE Visualization with DESeq2)###
+
+```{r ma-plots, fig.width = 6.7, fig.height = 5}
+ma_df <- function(r) as_tibble(as.data.frame(r), rownames = "ensemblID") |>
+  mutate(sig = !is.na(padj) & padj < PADJ_CUT)     # same cut-off as every other test (0.05)
+
+plot_ma <- function(df, title) {
+  ggplot(df, aes(baseMean, pmax(pmin(log2FoldChange, 2), -2), colour = sig)) +
+    geom_point(size = 0.4, stroke = 0, alpha = 0.7) +
+    geom_hline(yintercept = 0, linewidth = 0.3) +
+    scale_x_log10() +
+    scale_colour_manual(values = c(`FALSE` = "grey70", `TRUE` = "#2166AC"), guide = "none") +
+    labs(title = title, x = "Mean of normalized counts", y = "log2 fold change") +
+    theme_bulk()
+}
+
+p_ma <- fits |>
+  mutate(pre  = map2(fit, tissue, \(f, t) plot_ma(ma_df(f$res),    sprintf("%s · before shrinkage", t))),
+         post = map2(fit, tissue, \(f, t) plot_ma(ma_df(f$resLFC), sprintf("%s · after shrinkage", t)))) |>
+  dplyr::select(pre, post) |> pmap(list) |> list_flatten() |>
+  wrap_plots(ncol = 2)
+save_plot(p_ma, file.path(FIG_DIR, "deseq2", "maplot_pre_post_shrink"), "full", 110)
+p_ma
+```
+
+```{r volcano, fig.width = 6.7, fig.height = 4}
+# Not in the tutorial; standard companion to the MA plot. Genes of the candidate pathways are
+# coloured by pathway (first match if a gene is in several; OXPHOS = nuclear-encoded); candidate
+# genes (CANDIDATE GENES) are marked by tier; the top 3 per pathway by p value, any
+# padj < PADJ_CUT gene and every Tier 1 / Tier 2 candidate gene are labelled.
+plot_volcano <- function(de, tissue) {
+  df <- de |> dplyr::filter(!is.na(padj)) |>
+    left_join(cand_member, by = "ensemblID") |>
+    mutate(pathway = factor(replace_na(pathway, "Other"), levels = c(names(CANDIDATE_TERMS), "Other")),
+           sig = padj < PADJ_CUT)
+  tiers <- dplyr::filter(cand_genes, tissue == !!tissue)
+  df  <- df |> left_join(dplyr::select(tiers, ensemblID, tier), by = "ensemblID")
+  lab <- bind_rows(df |> dplyr::filter(pathway != "Other") |> group_by(pathway) |>
+                     slice_min(pvalue, n = 3, with_ties = FALSE) |> ungroup(),
+                   dplyr::filter(df, sig | !is.na(tier))) |> dplyr::distinct(ensemblID, .keep_all = TRUE)
+  ggplot(df, aes(log2FoldChange_shrunk, -log10(padj))) +
+    geom_point(data = dplyr::filter(df, pathway == "Other"), colour = "grey80", size = 0.4, stroke = 0) +
+    geom_point(data = dplyr::filter(df, pathway != "Other"), aes(colour = pathway), size = 0.7,
+               alpha = 0.85, stroke = 0) +
+    geom_point(data = dplyr::filter(df, sig), shape = 21, colour = "black", fill = NA, size = 1.2, stroke = 0.3) +
+    geom_point(data = dplyr::filter(df, !is.na(tier)), aes(shape = tier), colour = "black", size = 1.4,
+               stroke = 0.3) +
+    scale_shape_manual(values = c(`Tier 1` = 5, `Tier 2` = 4), name = NULL) +
+    geom_hline(yintercept = -log10(PADJ_CUT), linetype = 2, linewidth = 0.25) +
+    geom_text_repel(data = lab, aes(label = Symbol, colour = pathway), size = pt(6), show.legend = FALSE,
+                    segment.size = 0.2, max.overlaps = Inf, min.segment.length = 0) +
+    scale_colour_manual(values = c(CANDIDATE_COLS, Other = "black"), drop = FALSE,
+                        breaks = names(CANDIDATE_TERMS)) +
+    labs(title = tissue, x = "Shrunken log2 fold change (Cre / GFP)", y = "-log10 FDR", colour = NULL) +
+    theme_bulk() + theme(legend.position = "bottom") +
+    guides(colour = guide_legend(nrow = 2, override.aes = list(size = 1.5)))
+}
+p_volc <- map2(fits$de, fits$tissue, plot_volcano) |> wrap_plots(nrow = 1, guides = "collect") &
+  theme(legend.position = "bottom")
+save_plot(p_volc, file.path(FIG_DIR, "deseq2", "volcano_cre_vs_gfp"), "full", 100)
+p_volc
+
+# DEG volcano for the 2025-10-run test (Cre vs switch GFP; CANDIDATE GENES), where the DEGs are:
+# unshrunk log2FC, padj < PADJ_CUT genes filled by direction, candidate-pathway genes coloured,
+# every DEG labelled.
+plot_volcano_oct <- function(tissue) {
+  df  <- dplyr::filter(cand_genes_all, tissue == !!tissue, !is.na(padj_oct)) |>
+    mutate(pathway = factor(replace_na(pathway, "Other"), levels = c(names(CANDIDATE_TERMS), "Other")),
+           direction = case_when(padj_oct < PADJ_CUT & log2FC_oct > 0 ~ "Up in Cre",
+                                 padj_oct < PADJ_CUT & log2FC_oct < 0 ~ "Down in Cre", TRUE ~ "NS"))
+  lab <- dplyr::filter(df, direction != "NS")
+  ggplot(df, aes(log2FC_oct, -log10(padj_oct))) +
+    geom_point(data = dplyr::filter(df, pathway == "Other", direction == "NS"), colour = "grey80",
+               size = 0.4, stroke = 0) +
+    geom_point(data = dplyr::filter(df, pathway != "Other", direction == "NS"), aes(colour = pathway),
+               size = 0.6, alpha = 0.7, stroke = 0) +
+    geom_point(data = lab, aes(fill = direction), shape = 21, colour = "black", size = 1.4, stroke = 0.25) +
+    geom_hline(yintercept = -log10(PADJ_CUT), linetype = 2, linewidth = 0.25) +
+    geom_text_repel(data = lab, aes(label = Symbol), size = pt(6), colour = "black",
+                    segment.size = 0.2, max.overlaps = Inf, min.segment.length = 0) +
+    scale_colour_manual(values = CANDIDATE_COLS, name = NULL) +
+    scale_fill_manual(values = c(`Up in Cre` = GROUP_COLS[["Cre"]], `Down in Cre` = GROUP_COLS[["GFP"]]),
+                      name = NULL) +
+    labs(title = sprintf("%s · 2025-10 run: Cre vs switch GFP (%d DEGs)", tissue, nrow(lab)),
+         x = "log2 fold change (Cre / GFP)", y = "-log10 FDR") +
+    theme_bulk() + theme(legend.position = "bottom") +
+    guides(colour = guide_legend(nrow = 2, override.aes = list(size = 1.5)))
+}
+p_volc_oct <- map(TISSUES, plot_volcano_oct) |> wrap_plots(nrow = 1, guides = "collect") &
+  theme(legend.position = "bottom")
+save_plot(p_volc_oct, file.path(FIG_DIR, "deseq2", "volcano_2025_10_cre_vs_gfp"), "full", 100)
+p_volc_oct
+```
+
+```{r plot-counts, fig.width = 6.7, fig.height = 4}
+# Tutorial plotCounts(): normalized counts for hAPOE + the top 5 DEGs per tissue
+count_df <- function(fit, de, tissue, n = 5) {
+  genes <- unique(c(HUMAN_APOE,
+                    de |> dplyr::filter(padj < PADJ_CUT) |> slice_min(padj, n = n) |> pull(ensemblID)))
+  genes <- intersect(genes, rownames(fit$dds))
+  # offset-corrected counts for every AAV sample, so the 2025-10 GFP check samples show too
+  map(genes, \(g) plotCounts(fit$dds_display, gene = g, intgroup = c("cmp_group", "sex"),
+                             returnData = TRUE) |>
+        mutate(ensemblID = g)) |>
+    bind_rows() |>
+    left_join(dplyr::select(id2name, ensemblID, Symbol), by = "ensemblID") |>
+    mutate(tissue = tissue)
+}
+
+counts_long <- pmap(list(fits$fit, fits$de, fits$tissue), count_df) |> bind_rows()
+p_counts <- ggplot(counts_long, aes(cmp_group, count, colour = cmp_group)) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.3, width = 0.6, colour = "grey40") +
+  geom_point(aes(shape = sex), size = 0.9, position = position_jitter(width = 0.15, seed = 1)) +
+  facet_wrap(~ tissue + Symbol, scales = "free_y", nrow = 2) +
+  scale_y_log10() +
+  scale_x_discrete(labels = c(`Cre (2025-10)` = "Cre", `GFP (2025-04)` = "GFP",
+                              `GFP check (2025-10)` = "GFP\ncheck")) +
+  scale_colour_manual(values = CMP_COLS, guide = "none") +
+  scale_shape_manual(values = c(Female = 1, Male = 16)) +
+  labs(x = NULL, y = "Normalized count", shape = NULL) +
+  theme_bulk() + theme(legend.position = "top")
+save_plot(p_counts, file.path(FIG_DIR, "deseq2", "normalized_count_examples"), "full", 90)
+p_counts
+```
+
+```{r sample-heatmaps}
+# Tutorial: rlog -> sample distance + Pearson correlation heatmaps. All AAV samples of the
+# tissue, with the bridge-estimated run offset applied to the 2025-04 samples (the same
+# normalization factors the primary test uses), so the 2025-10 GFP check samples should sit
+# among the 2025-04 GFP if the correction worked.
+anno_cols <- list(cmp_group = CMP_COLS, sex = c(Female = "grey30", Male = "grey80"))
+
+sample_heatmaps <- function(fit, tissue) {
+  rld  <- rlog(fit$dds_display, blind = TRUE)
+  ann  <- as.data.frame(colData(rld))[, c("cmp_group", "sex")]
+  d    <- dist(t(assay(rld)))
+  dmat <- as.matrix(d)
+  common <- list(annotation_col = ann, annotation_colors = anno_cols, fontsize = 6,
+                 fontfamily = FONT, border_color = NA, treeheight_row = 10,
+                 treeheight_col = 10, silent = TRUE)
+  ph_dist <- do.call(pheatmap, c(list(dmat, clustering_distance_rows = d,
+                                      clustering_distance_cols = d,
+                                      color = colorRampPalette(rev(RColorBrewer::brewer.pal(9, "Blues")))(255),
+                                      main = tissue), common))
+  ph_cor  <- do.call(pheatmap, c(list(cor(assay(rld), method = "pearson"), main = tissue), common))
+  save_pheatmap(ph_dist, file.path(FIG_DIR, "qc", sprintf("distance_sample_heatmap_%s", tolower(tissue))))
+  save_pheatmap(ph_cor,  file.path(FIG_DIR, "qc", sprintf("similarity_sample_heatmap_%s", tolower(tissue))))
+  list(rld = rld, dist = ph_dist, cor = ph_cor)
+}
+
+rlds <- map2(fits$fit, fits$tissue, sample_heatmaps) |> set_names(fits$tissue)
+walk(rlds, \(x) { grid::grid.newpage(); grid::grid.draw(x$dist$gtable) })
+```
+
+```{r pca, fig.width = 6.7, fig.height = 3}
+# Not in the tutorial; PCA on the same run-offset-corrected rlog values
+plot_pca <- function(rld, tissue) {
+  df <- plotPCA(rld, intgroup = c("cmp_group", "sex"), returnData = TRUE)
+  ve <- round(100 * attr(df, "percentVar"), 1)
+  ggplot(df, aes(PC1, PC2, colour = cmp_group, shape = sex)) +
+    geom_point(size = 1.6) +
+    geom_text_repel(aes(label = name), size = pt(6), show.legend = FALSE,
+                    segment.size = 0.2, max.overlaps = Inf) +
+    scale_colour_manual(values = CMP_COLS) +
+    scale_shape_manual(values = c(Female = 17, Male = 16)) +
+    labs(title = tissue, x = sprintf("PC1 (%s%%)", ve[1]), y = sprintf("PC2 (%s%%)", ve[2]),
+         colour = NULL, shape = NULL) +
+    theme_bulk()
+}
+p_pca <- imap(rlds, \(x, t) plot_pca(x$rld, t)) |>
+  wrap_plots(nrow = 1, guides = "collect") & theme(legend.position = "bottom")
+save_plot(p_pca, file.path(FIG_DIR, "qc", "pca_rlog"), "full", 80)
+p_pca
+```
+
+```{r sig-gene-heatmap}
+# Tutorial: heatmap of significant genes (rlog): the top 50 genes by padj among
+# padj < PADJ_CUT (0.05), row-scaled.
+sig_heatmap <- function(rld, de, tissue, n = 50) {
+  top <- de |> dplyr::filter(padj < PADJ_CUT) |> slice_min(padj, n = n, with_ties = FALSE)
+  if (nrow(top) < 2) return(NULL)
+  mat <- assay(rld)[top$ensemblID, ]
+  rownames(mat) <- top$Symbol
+  ann <- as.data.frame(colData(rld))[, c("cmp_group", "sex")]
+  ord <- order(ann$cmp_group, ann$sex)
+  ph <- pheatmap(mat[, ord], scale = "row", cluster_cols = FALSE, annotation_col = ann[ord, ],
+                 annotation_colors = anno_cols,
+                 gaps_col = cumsum(table(ann$cmp_group))[-nlevels(ann$cmp_group)],
+                 color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(101),
+                 breaks = seq(-2, 2, length.out = 102), fontsize = 6, fontfamily = FONT,
+                 border_color = NA, treeheight_row = 10, main = tissue, silent = TRUE)
+  save_pheatmap(ph, file.path(FIG_DIR, "deseq2", sprintf("sig_gene_heatmap_%s", tolower(tissue))),
+                "single", max(60, 2.6 * nrow(top) + 30))
+  ph
+}
+sig_hms <- pmap(list(map(rlds, "rld"), fits$de, fits$tissue), sig_heatmap) |> compact()
+walk(sig_hms, \(ph) { grid::grid.newpage(); grid::grid.draw(ph$gtable) })
+```
+
+###PATHWAY ANALYSIS (tutorial: DE Pathway Analysis, clusterProfiler)###
+
+Following the tutorial: Ensembl → Entrez with `mapIds(multiVals = "first")`, retrying unmapped genes by symbol, dropping duplicate Entrez IDs, and ranking genes by log2 fold change for `gseGO`. Two deliberate changes from the tutorial code:
+
+- the GSEA ranking uses **every tested gene** (the tutorial ranks only the significant genes, which leaves GSEA nothing to compare against), ranked by the **apeglm-shrunken** log2FC so noisy low-count genes don't dominate the extremes;
+- custom contigs (hAPOE, transgenes) are removed, as the tutorial removes ERCC spike-ins.
+
+```{r pathway-ids}
+# Clear this section's previous outputs so a result that is empty this run cannot leave an
+# older file behind (these folders hold only files written by the pathway chunks).
+walk(file.path(c(CSV_DIR, FIG_DIR), "pathway"),
+     \(d) unlink(list.files(d, full.names = TRUE)))
+
+map_entrez <- function(de) {
+  d <- de |>
+    dplyr::filter(!is.na(padj), str_starts(ensemblID, "ENSMUSG")) |>
+    mutate(entrez = mapIds(org.Mm.eg.db, keys = ensemblID, column = "ENTREZID",
+                           keytype = "ENSEMBL", multiVals = "first"))
+  miss <- is.na(d$entrez) & !is.na(d$Symbol) & d$Symbol %in% keys(org.Mm.eg.db, "SYMBOL")
+  if (any(miss))
+    d$entrez[miss] <- mapIds(org.Mm.eg.db, keys = d$Symbol[miss], column = "ENTREZID",
+                             keytype = "SYMBOL", multiVals = "first")
+  d |> dplyr::filter(!is.na(entrez)) |> dplyr::distinct(entrez, .keep_all = TRUE)
+}
+
+ranked_genes <- function(d) sort(set_names(d$log2FoldChange_shrunk, d$entrez), decreasing = TRUE)
+
+paths <- fits |>
+  transmute(tissue, mapped = map(de, map_entrez), ranked = map(mapped, ranked_genes))
+paths |> transmute(tissue, n_mapped = map_int(mapped, nrow))
+```
+
+```{r pathway-gsea}
+# gseGO for each GO ontology (tutorial ran CC; BP and MF added)
+run_gsego <- function(ranked, ont)
+  gseGO(geneList = ranked, OrgDb = org.Mm.eg.db, ont = ont, keyType = "ENTREZID",
+        minGSSize = 15, maxGSSize = 500, pvalueCutoff = PADJ_CUT, eps = 0,
+        seed = TRUE, verbose = FALSE) |>
+  setReadable(OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+
+gsea <- expand_grid(tissue = TISSUES, ont = c("BP", "MF", "CC")) |>
+  left_join(dplyr::select(paths, tissue, ranked), by = "tissue") |>
+  mutate(res = map2(ranked, ont, run_gsego),
+         n_sig = map_int(res, \(r) nrow(as.data.frame(r))))
+saveRDS(dplyr::select(gsea, -ranked), file.path(OBJ_DIR, "gseGO_cre_vs_gfp.rds"))
+dplyr::select(gsea, tissue, ont, n_sig)
+
+gsea |>
+  dplyr::filter(n_sig > 0) |>
+  pwalk(\(tissue, ont, ranked, res, n_sig)
+        write_tsv(as.data.frame(res),
+                  file.path(CSV_DIR, "pathway", sprintf("%s_gseGO_%s.tsv", tolower(tissue), ont))))
+```
+
+```{r pathway-gsea-loo}
+# Robustness of each primary GSEA term:
+#  - leave-one-out: GSEA rerun on the primary model refit without each 2025-10 GFP mouse
+#    (fits$fit[[.]]$loo); must stay significant, same NES sign;
+#  - within-run direction: GSEA on the 2025-10-only Cre vs GFP fold changes; NES must have the
+#    same sign (direction only; that comparison has 3 GFP).
+# gseGO is run with every term returned (pvalueCutoff = 1) so missing terms are real misses.
+gsea_all <- function(lfc_tbl, ont)
+  gseGO(geneList = ranked_genes(map_entrez(lfc_tbl)), OrgDb = org.Mm.eg.db, ont = ont,
+        keyType = "ENTREZID", minGSSize = 15, maxGSSize = 500, pvalueCutoff = 1, eps = 0,
+        seed = TRUE, verbose = FALSE) |>
+  as.data.frame()
+
+lfc_table <- function(res, lfc)
+  as_tibble(as.data.frame(res), rownames = "ensemblID") |>
+  mutate(log2FoldChange_shrunk = lfc) |>
+  left_join(dplyr::select(id2name, ensemblID, Symbol), by = "ensemblID")
+
+fit_of <- set_names(fits$fit, fits$tissue)
+
+gsea_loo <- gsea |>
+  dplyr::filter(n_sig > 0) |>
+  dplyr::select(tissue, ont, res) |>
+  mutate(loo = map2(tissue, ont, \(t, o)
+           imap(fit_of[[t]]$loo, \(l, b) gsea_all(lfc_table(l$res, l$lfc), o) |>
+                  transmute(ID, NES_loo = NES, padj_loo = p.adjust, dropped = b)) |>
+             bind_rows() |> (\(x) if (nrow(x)) x else
+               tibble(ID = character(), NES_loo = double(), padj_loo = double(), dropped = character()))()),
+         within = map2(tissue, ont, \(t, o) {
+           w <- fit_of[[t]]$within
+           gsea_all(lfc_table(w, w$log2FoldChange), o) |> transmute(ID, NES_within = NES)
+         }),
+  robust = pmap(list(res, loo, within), \(r, l, w) {
+    n_fits <- n_distinct(l$dropped)
+    as.data.frame(r) |>
+      dplyr::select(ID, Description, NES, p.adjust) |>
+      left_join(l, by = "ID") |>
+      group_by(ID, Description, NES, p.adjust) |>
+      summarise(n_loo = sum(!is.na(padj_loo)),
+                loo_max_padj = suppressWarnings(max(padj_loo, na.rm = TRUE)),
+                loo_same_sign = all(sign(NES_loo) == sign(NES[1]), na.rm = TRUE),
+                drivers = paste(dropped[!is.na(dropped) & (is.na(padj_loo) | padj_loo >= PADJ_CUT |
+                                          sign(NES_loo) != sign(NES[1]))], collapse = ";"),
+                .groups = "drop") |>
+      left_join(w, by = "ID") |>
+      mutate(within_same_sign = sign(NES_within) == sign(NES),
+             loo_ok = n_fits == 0 |
+               (n_loo == n_fits & loo_same_sign & loo_max_padj < PADJ_CUT),
+             robust = loo_ok & within_same_sign %in% TRUE) |>
+      arrange(desc(robust), p.adjust)
+  }))
+
+pwalk(dplyr::select(gsea_loo, tissue, ont, robust), \(tissue, ont, robust)
+      write_tsv(robust, file.path(CSV_DIR, "pathway",
+                                  sprintf("%s_gseGO_%s_loo_robustness.tsv", tolower(tissue), ont))))
+gsea_loo |> transmute(tissue, ont, n_terms = map_int(robust, nrow),
+                      n_robust = map_int(robust, \(r) sum(r$robust)))
+```
+
+```{r pathway-gsea-plots, fig.width = 6.7, fig.height = 5}
+# Tutorial plots: dotplot, ridgeplot, cnetplot, gseaplot of the top term
+gsea_figs <- function(tissue, ont, ranked, res, n_sig) {
+  stem <- file.path(FIG_DIR, "pathway", sprintf("%s_gseGO_%s", tolower(tissue), ont))
+  ttl  <- sprintf("%s · GO %s", tissue, ont)
+  dot <- dotplot(res, showCategory = 15, split = ".sign", font.size = 6, label_format = 45) +
+    facet_grid(~ .sign) + labs(title = ttl) + theme_bulk() +
+    theme(axis.text.y = element_text(size = 6))
+  ridge <- ridgeplot(res, showCategory = 15, label_format = 45) +
+    labs(title = ttl, x = "Shrunken log2FC") + theme_bulk() +
+    theme(axis.text.y = element_text(size = 6))
+  cnet <- cnetplot(res, foldChange = ranked, showCategory = 5) +
+    labs(title = ttl) +
+    theme(text = element_text(size = 6, family = FONT),
+          legend.text = element_text(size = 6), legend.title = element_text(size = 7),
+          plot.title = element_text(size = 7, face = "bold"))
+  # gseaplot2 draws tick labels at 0.8 x base_size; 8 keeps them >= 6 pt
+  curve <- gseaplot2(res, geneSetID = 1, title = res$Description[1], base_size = 8,
+                     subplots = 1:2, rel_heights = c(1.5, 0.4))
+  save_plot(dot,   paste0(stem, "_dotplot"),   "full", 110)
+  save_plot(ridge, paste0(stem, "_ridgeplot"), "onehalf", 110)
+  save_plot(cnet,  paste0(stem, "_cnetplot"),  "full", 130)
+  save_plot(curve, paste0(stem, "_top_term_gseaplot"), "onehalf", 80)
+  # enrichment curves for the candidate pathways that are significant here (e.g. OXPHOS)
+  cand_ids <- intersect(unname(CANDIDATE_TERMS), res$ID)
+  if (length(cand_ids)) {
+    cc <- gseaplot2(res, geneSetID = cand_ids, base_size = 8, subplots = 1:2,
+                    rel_heights = c(1.5, 0.4), title = sprintf("%s · candidate pathways", tissue))
+    save_plot(cc, paste0(stem, "_candidate_gseaplot"), "onehalf", 90)
+  }
+  list(dot = dot, ridge = ridge)
+}
+
+# figures show every significant term (padj < PADJ_CUT); the leave-one-out robustness of each
+# term is in csv/pathway/*_loo_robustness.tsv
+gsea_plots <- gsea |>
+  dplyr::filter(n_sig > 0) |>
+  dplyr::select(tissue, ont, res, n_sig) |>
+  left_join(dplyr::select(paths, tissue, ranked), by = "tissue") |>
+  dplyr::select(tissue, ont, ranked, res, n_sig) |>
+  pmap(gsea_figs)
+walk(gsea_plots, \(x) print(x$dot))
+```
+
+```{r pathway-ora}
+# ORA of the significant genes: GO BP (enrichGO) and KEGG (enrichKEGG, as in the tutorial),
+# split by direction, universe = every tested gene with an Entrez ID.
+run_ora <- function(mapped) {
+  sig  <- dplyr::filter(mapped, padj < PADJ_CUT)
+  sets <- split(sig$entrez, if_else(sig$log2FoldChange > 0, "Up in Cre", "Down in Cre"))
+  if (length(sets) == 0) return(list(go = NULL, kegg = NULL))
+  go <- compareCluster(sets, fun = "enrichGO", OrgDb = org.Mm.eg.db, keyType = "ENTREZID",
+                       ont = "BP", universe = mapped$entrez, pvalueCutoff = PADJ_CUT,
+                       qvalueCutoff = 1,     # padj < PADJ_CUT is the only significance rule
+                       readable = TRUE)
+  # KEGG is queried live from kegg.jp; skipped (NULL) if offline
+  kegg <- tryCatch(compareCluster(sets, fun = "enrichKEGG", organism = "mmu",
+                                  universe = mapped$entrez, pvalueCutoff = PADJ_CUT,
+                                  qvalueCutoff = 1),
+                   error = \(e) { message("KEGG unavailable: ", conditionMessage(e)); NULL })
+  list(go = go, kegg = kegg)
+}
+
+ora <- paths |> transmute(tissue, ora = map(mapped, run_ora))
+saveRDS(ora, file.path(OBJ_DIR, "ora_cre_vs_gfp.rds"))
+
+ora_out <- ora |>
+  mutate(go = map(ora, "go"), kegg = map(ora, "kegg")) |>
+  dplyr::select(-ora) |>
+  pivot_longer(c(go, kegg), names_to = "db", values_to = "res") |>
+  dplyr::filter(!map_lgl(res, \(r) is.null(r) || nrow(as.data.frame(r)) == 0))
+
+pwalk(ora_out, \(tissue, db, res) {
+  stem <- file.path(sprintf("%s_ORA_%s", tolower(tissue), db))
+  write_tsv(as.data.frame(res), file.path(CSV_DIR, "pathway", paste0(stem, ".tsv")))
+  p <- dotplot(res, showCategory = 10, font.size = 6, label_format = 45) +
+    labs(title = sprintf("%s · %s", tissue, toupper(db)), x = NULL) + theme_bulk() +
+    theme(axis.text.y = element_text(size = 6))
+  save_plot(p, file.path(FIG_DIR, "pathway", paste0(stem, "_dotplot")), "onehalf", 110)
+  print(p)
+})
+```
+
+```{r pathway-pathview, eval = FALSE}
+# Tutorial pathview diagram for the top KEGG pathway per tissue (downloads KEGG maps; writes
+# PNGs to the working directory, so run it from figures/pathway).
+library(pathview)
+old <- setwd(file.path(FIG_DIR, "pathway"))
+ora_out |>
+  dplyr::filter(db == "kegg") |>
+  pwalk(\(tissue, db, res) {
+    id <- as.data.frame(res)$ID[1]
+    pathview(gene.data = paths$ranked[[match(tissue, paths$tissue)]], pathway.id = id,
+             species = "mmu", limit = list(gene = c(-2, 2)),
+             low = "blue", mid = "white", high = "red",
+             out.suffix = paste0(tolower(tissue), "_cre_vs_gfp"))
+  })
+setwd(old)
+```
+
+###HEAD-TO-HEAD: PREVIOUS PIPELINE (DE analysis I, 2025-10-24)###
+
+The earlier analysis (ljohnsonlab.github.io/4s2_liver, "Differential Expression Analysis I")
+reproduced on this project's counts, then compared gene by gene with both its published tables
+(saved in `objects/reference/previous_DE_analysis1/`) and with the analysis above.
+
+Previous pipeline, as described on that page: nf-core/rnaseq (stock GRCm39, Ensembl 114, no
+transgene / human APOE contigs); Batch 1 (2025-04 GFP) and Batch 2 (2025-10 Cre + GFP) analysed
+together; technical replicates collapsed by averaging counts; genes kept with >= 20 counts in
+>= 5 samples; DESeq2 `~ Sex + group`, **no batch term**; DEG = FDR < 0.01 and |log2FC| > 1;
+"high-confidence" = DEGs after removing -ps / -rs pseudogenes, Gm / Rik / unannotated loci,
+mt- and Rp genes. Reproduced here exactly, except the counts (STAR on the custom reference) and
+the sample list as recorded at the time (B13 included, as it was then).
+
+```{r previous-pipeline}
+prev_dir <- file.path(IN_DIR, "reference", "previous_DE_analysis1")
+prev <- map(set_names(c("liver_all", "liver_hc", "brain_all", "brain_hc")),
+            \(x) read_tsv(file.path(prev_dir, sprintf("prev_%s.tsv", x)), show_col_types = FALSE))
+meta_all <- read_csv(file.path(IN_DIR, "sample_metadata.csv"), show_col_types = FALSE) |>
+  mutate(sex = factor(sex), group = factor(group, levels = c("GFP Control", "Cre-AAV")))
+hc_drop <- "-ps\\d*$|-rs\\d*$|^Gm\\d+|Rik\\d*$|^ENSMUS|^mt-|^Rp[ls]"
+allCounts <- read_counts(COUNT_SOURCE)      # full matrix: B13 is part of the reproduction
+
+prev_pipeline <- function(tissue) {
+  m <- meta_all |> dplyr::filter(tissue == !!tissue, arm == "AAV")      # B13 included, as then
+  # collapse technical replicates (same mouse in both runs) by averaging counts
+  cts <- allCounts[setdiff(rownames(allCounts), CONSTRUCT_GENES), m$sample]
+  by_mouse <- split(m$sample, m$mouse_id)
+  cm <- sapply(by_mouse, \(s) round(rowMeans(cts[, s, drop = FALSE])))
+  mm <- m |> dplyr::distinct(mouse_id, .keep_all = TRUE) |> column_to_rownames("mouse_id")
+  mm <- mm[colnames(cm), ]
+  cm <- cm[rowSums(cm >= 20) >= 5, ]                                    # >= 20 counts in >= 5 samples
+  r <- DESeqDataSetFromMatrix(cm, mm, ~ sex + group) |> DESeq(quiet = TRUE) |>
+    results(name = "group_Cre.AAV_vs_GFP.Control")
+  tibble(ensemblID = rownames(r), baseMean = r$baseMean, log2FC = r$log2FoldChange, padj = r$padj) |>
+    left_join(dplyr::select(id2name, ensemblID, Symbol), by = "ensemblID") |>
+    mutate(Symbol = coalesce(Symbol, ensemblID),
+           deg = !is.na(padj) & padj < 0.01 & abs(log2FC) > 1,
+           hc  = deg & !str_detect(Symbol, hc_drop))
+}
+repro <- map(set_names(TISSUES), prev_pipeline)
+
+# same-mouse run difference (2025-10 minus 2025-04) from the double-run mice, for every gene:
+# a "DEG" pointing the same way as this is what the run alone would produce
+run_diff_tissue <- function(tissue) {
+  m  <- meta_all |> dplyr::filter(tissue == !!tissue, arm == "AAV", sample != "B13")
+  pr <- m |> group_by(mouse_id) |> dplyr::filter(n_distinct(run) == 2) |> ungroup()
+  y  <- log2(t(t(allCounts[, pr$sample]) / estimateSizeFactorsForMatrix(allCounts[, pr$sample])) + 1)
+  d  <- map(split(pr, pr$mouse_id), \(b) y[, b$sample[b$run == CRE_RUN]] - y[, b$sample[b$run == GFP_RUN]])
+  tibble(ensemblID = rownames(y), run_diff = purrr::reduce(d, `+`) / length(d))
+}
+
+h2h_tissue <- function(tissue) {
+  t  <- tolower(tissue)
+  rp <- repro[[tissue]]
+  cur_main <- fits$de[[match(tissue, fits$tissue)]] |> dplyr::select(ensemblID, padj_current = padj,
+                                                                    log2FC_current = log2FoldChange_shrunk)
+  cur_oct  <- cand_genes_all |> dplyr::filter(tissue == !!tissue) |>
+    dplyr::select(ensemblID, log2FC_oct, padj_oct, tier)
+  prev[[paste0(t, "_hc")]] |>
+    dplyr::rename(Symbol = gene, log2FC_prev = log2FoldChange, padj_prev = padj) |>
+    mutate(Symbol = if_else(Symbol == "APOE", "hAPOE", Symbol)) |>
+    left_join(dplyr::select(rp, ensemblID, Symbol, log2FC_repro = log2FC, padj_repro = padj, deg_repro = deg) |>
+                dplyr::distinct(Symbol, .keep_all = TRUE), by = "Symbol") |>
+    left_join(run_diff_tissue(tissue), by = "ensemblID") |>
+    left_join(cur_main, by = "ensemblID") |> left_join(cur_oct, by = "ensemblID") |>
+    mutate(tissue = tissue,
+           follows_run = sign(run_diff) == sign(log2FC_prev) & abs(run_diff) > 0.5,
+           # all of these symbols exist in the annotation; they fail the >= 20-count filter here
+           # because STAR GeneCounts / htseq count uniquely-mapped reads only, and their previous
+           # "expression" was largely multi-mapped reads (retrogenes, multi-copy RNAs, paralogs)
+           verdict = case_when(is.na(ensemblID) ~ "too few uniquely-mapped reads to test",
+                               !is.na(tier) ~ paste("candidate here:", tier),
+                               follows_run %in% TRUE ~ "run artifact (same-mouse run difference, same direction)",
+                               TRUE ~ "not supported once run is controlled")) |>
+    relocate(tissue, Symbol, verdict)
+}
+h2h <- map(TISSUES, h2h_tissue) |> bind_rows()
+write_csv(h2h, file.path(CSV_DIR, "deseq2", "head_to_head_previous_hc_genes.csv"))
+
+# summary: published vs reproduced vs current
+h2h_summary <- map(TISSUES, \(tissue) {
+  t <- tolower(tissue); rp <- repro[[tissue]]
+  prev_all <- prev[[paste0(t, "_all")]]$gene; prev_hc <- prev[[paste0(t, "_hc")]]$gene
+  tibble(tissue,
+         published_DEGs = length(prev_all), reproduced_DEGs = sum(rp$deg),
+         published_hc = length(prev_hc), reproduced_hc = sum(rp$hc),
+         hc_overlap = length(intersect(prev_hc, rp$Symbol[rp$hc])),
+         r_log2FC_published_vs_reproduced = {
+           j <- inner_join(prev[[paste0(t, "_all")]], rp, by = c(gene = "Symbol"))
+           cor(j$log2FoldChange, j$log2FC) },
+         hc_following_run_pct = 100 * mean(dplyr::filter(h2h, tissue == !!tissue)$follows_run, na.rm = TRUE),
+         current_main_DEGs = sum(fits$de[[match(tissue, fits$tissue)]]$padj < PADJ_CUT, na.rm = TRUE),
+         current_2025_10_DEGs = sum(cand_genes_all$tissue == tissue & cand_genes_all$sig_oct))
+}) |> bind_rows()
+write_csv(h2h_summary, file.path(CSV_DIR, "deseq2", "head_to_head_summary.csv"))
+h2h_summary
+h2h |> dplyr::count(tissue, verdict)
+h2h |> dplyr::filter(Symbol %in% c("hAPOE", "Eno1b", "Uba52rt", "Adrm1b", "Kpna2rt", "Ube2srt", "Hspb1")) |>
+  dplyr::select(tissue, Symbol, verdict, log2FC_prev, log2FC_repro, run_diff, padj_current, padj_oct) |>
+  mutate(across(where(is.numeric), \(x) signif(x, 2)))
+```
+
+```{r head-to-head-plot, fig.width = 6.7, fig.height = 3.2}
+p_h2h <- h2h |> dplyr::filter(!is.na(run_diff)) |>
+  ggplot(aes(run_diff, log2FC_prev, colour = verdict)) +
+  geom_hline(yintercept = 0, linewidth = 0.25) + geom_vline(xintercept = 0, linewidth = 0.25) +
+  geom_point(size = 1) +
+  geom_text_repel(data = \(d) dplyr::filter(d, Symbol %in% c("hAPOE", "Eno1b", "Uba52rt", "Adrm1b") |
+                                               str_starts(verdict, "candidate")),
+                  aes(label = Symbol), size = pt(6), show.legend = FALSE, segment.size = 0.2,
+                  max.overlaps = Inf) +
+  facet_wrap(~ tissue) +
+  scale_colour_manual(values = c("run artifact (same-mouse run difference, same direction)" = "#B2182B",
+                                 "not supported once run is controlled" = "grey50",
+                                 "candidate here: Tier 1" = "#1B7837", "candidate here: Tier 2" = "#5AAE61",
+                                 "too few uniquely-mapped reads to test" = "grey80")) +
+  labs(x = "Same-mouse run difference, log2 (2025-10 - 2025-04)",
+       y = "Previous analysis log2FC (Cre / GFP)", colour = NULL) +
+  theme_bulk() + theme(legend.position = "bottom") + guides(colour = guide_legend(ncol = 2))
+save_plot(p_h2h, file.path(FIG_DIR, "deseq2", "head_to_head_previous_hc_genes"), "full", 95)
+p_h2h
+```
+
+```{r session}
+sessionInfo()
+```
+

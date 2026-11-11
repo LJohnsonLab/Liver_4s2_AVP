@@ -1,0 +1,263 @@
+# Switched mice vs germline E2 and E4 controls {#sec-germline}
+
+The switch mice are compared with the EFAD mice, which carry human *APOE2*, *APOE3* or *APOE4* for life. All of these samples were sequenced in the 2025-10 run, so these comparisons have **no run confound**. They also use none of the 2025-04 samples.
+
+**What they show:** whether the switched liver moves toward germline E2, stays like E4, or goes somewhere else. Switch GFP is still E4 in liver, so Switch GFP vs EFAD E4 measures how far apart the two mouse models are before any switch.
+
+::: {.callout-warning}
+## Limitations
+
+The EFAD mice are not matched controls for the switch:
+
+- **Sex:** all EFAD mice are male. The switch groups are mixed (liver: 5 F / 5 M Cre, 1 F / 2 M GFP). Set `GERM_MALES_ONLY <- TRUE` below to restrict the switch groups to males.
+- **Age and exposure:** EFAD mice carried E2 / E4 from conception. The switch mice carried E4 until the AAV at 2 months, then E2 in hepatocytes only, for about 10 months. Brain, and any non-hepatocyte cell, stays E4.
+- **Colony and transgene:** the EFAD mice are 5xFAD heterozygous, from a separate colony. Switch GFP vs EFAD E4 estimates this whole package of differences.
+- **Group size:** n = 3 per EFAD genotype, so germline estimates are noisy and germline p values are weak.
+
+A switch effect that disagrees with germline E2 vs E4 is therefore not evidence against it. An acute, adult-onset, hepatocyte-only switch need not reproduce lifelong whole-body E2.
+:::
+
+```{r}
+#| include: false
+source("_common.R")   # chapters render from report/
+ckpt_load("06")
+```
+
+## Setup
+
+```{r germ-setup}
+GERM_MALES_ONLY <- FALSE     # TRUE: switch groups restricted to males (EFAD mice are all male)
+# column order runs from E4 to E2: the switch starts as E4 (GFP) and Cre moves hepatocytes to E2
+GERM_LEVELS <- c("EFAD E4", "Switch GFP", "Switch Cre", "EFAD E3", "EFAD E2")
+GERM_COLS   <- c(`EFAD E4` = "#B2182B", `Switch GFP` = GROUP_COLS[["GFP"]],
+                 `Switch Cre` = GROUP_COLS[["Cre"]], `EFAD E3` = "#878787", `EFAD E2` = "#2166AC")
+
+germ_meta <- function(tissue) {
+  m <- cur_meta(tissue)
+  if (GERM_MALES_ONLY) m <- m[m$arm != "AAV" | m$sex == "Male", , drop = FALSE]
+  m |> mutate(group = factor(as.character(group), levels = GERM_LEVELS)) |> droplevels()
+}
+# variance-stabilised expression of the 2025-10 samples of a tissue (same normalisation as every model)
+germ_vst <- map(set_names(TISSUES), \(t) {
+  m <- germ_meta(t)
+  dds <- DESeqDataSetFromMatrix(geneCounts[gene_qc[[t]]$keep, rownames(m)], m, ~ 1) |> norm_dds()
+  list(meta = m, vst = assay(vst(dds, blind = TRUE)),
+       norm = counts(dds, normalized = TRUE))
+})
+germ_meta("Liver") |> dplyr::count(group, sex)
+```
+
+## APOE genotype and expression per group
+
+The liver E2 allelic fraction is the fraction of hAPOE reads with the E2 base at rs7412. It shows how far each switched liver has moved toward a germline E2 liver; brain should stay E4 in the switch mice.
+
+```{r germ-apoe, fig.width = 6.85, fig.height = 2.6}
+apoe_df <- imap(germ_vst, \(x, t) tibble(sample = colnames(x$norm), tissue = t,
+                                         group = x$meta$group, sex = x$meta$sex,
+                                         hAPOE = x$norm[HUMAN_APOE, ])) |> bind_rows() |>
+  left_join(dplyr::select(apoe_calls, sample, rs7412_T_frac, rs7412_n), by = "sample")
+write_csv(apoe_df, file.path(CSV_DIR, "deseq2", "germline_apoe_by_sample.csv"))
+
+germ_box <- function(d, y, ylab, log = FALSE) {
+  p <- ggplot(d, aes(group, .data[[y]], colour = group)) +
+    geom_boxplot(outlier.shape = NA, linewidth = 0.3, width = 0.6, colour = "grey50") +
+    geom_point(aes(shape = sex), size = 1, position = position_jitter(width = 0.15, seed = 1)) +
+    scale_colour_manual(values = GERM_COLS, guide = "none") +
+    scale_shape_manual(values = c(Female = 1, Male = 16), name = NULL) +
+    labs(x = NULL, y = ylab) +
+    theme_bulk() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  if (log) p + scale_y_log10() else p
+}
+p_apoe <- (germ_box(dplyr::filter(apoe_df, tissue == "Liver"), "rs7412_T_frac", "Liver E2 allele fraction (rs7412 T)") +
+           germ_box(apoe_df, "hAPOE", "hAPOE (normalised counts)", log = TRUE) + facet_wrap(~ tissue)) +
+  plot_layout(widths = c(1, 2), guides = "collect") + plot_annotation(tag_levels = "a") &
+  theme(legend.position = "bottom", plot.tag = element_text(size = 8, face = "bold"))
+save_plot(p_apoe, file.path(FIG_DIR, "deseq2", "germline_apoe_by_group"), "full", 66)
+p_apoe
+```
+
+## Where the switched liver sits overall
+
+Four views of the whole transcriptome, all using 2025-10 samples only:
+
+- **(a, b) PCA** of the 500 most variable genes.
+- **(c) E2-likeness score.** Each sample's position on the germline E2-vs-E4 axis: the mean z of the top-200 germline E2-up genes minus the top-200 E2-down genes. The EFAD E2 / E4 mice define that axis, so their own scores are optimistic. The switch mice are scored out of sample.
+- **(d) Direct comparison.** DEGs (padj < 0.05) between each switch group and each germline group, in one model per tissue (`~ sex [+ extraction batch] + group`).
+
+```{r germ-global, fig.width = 6.85, fig.height = 5.6}
+germ_pca <- function(t) {
+  x  <- germ_vst[[t]]
+  v  <- x$vst[head(order(apply(x$vst, 1, var), decreasing = TRUE), 500), ]
+  pc <- prcomp(t(v))
+  ve <- round(100 * pc$sdev^2 / sum(pc$sdev^2))
+  tibble(PC1 = pc$x[, 1], PC2 = pc$x[, 2], group = x$meta$group, sex = x$meta$sex) |>
+    ggplot(aes(PC1, PC2, colour = group, shape = sex)) +
+    geom_point(size = 1.4) +
+    scale_colour_manual(values = GERM_COLS, name = NULL, drop = FALSE) +
+    scale_shape_manual(values = c(Female = 1, Male = 16), name = NULL) +
+    labs(title = t, x = sprintf("PC1 (%d%%)", ve[1]), y = sprintf("PC2 (%d%%)", ve[2])) +
+    theme_bulk()
+}
+e2_df <- scores |> mutate(group = factor(as.character(group), levels = GERM_LEVELS)) |>
+  dplyr::filter(!GERM_MALES_ONLY | !str_starts(group, "Switch") | sex == "Male")
+p_e2like <- ggplot(e2_df, aes(group, e2_likeness, colour = group)) +
+  geom_hline(yintercept = 0, linewidth = 0.25, linetype = 2) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.3, width = 0.6, colour = "grey50") +
+  geom_point(aes(shape = sex), size = 1, position = position_jitter(width = 0.15, seed = 1)) +
+  facet_wrap(~ tissue) +
+  scale_colour_manual(values = GERM_COLS, guide = "none") +
+  scale_shape_manual(values = c(Female = 1, Male = 16), name = NULL) +
+  labs(x = NULL, y = "E2-likeness score") +
+  theme_bulk() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_direct <- direct |>
+  separate(comparison, c("switch", "germline"), sep = " vs ") |>
+  mutate(switch = factor(switch, levels = c("Switch GFP", "Switch Cre")),
+         germline = factor(germline, levels = c("EFAD E4", "EFAD E2"))) |>
+  ggplot(aes(germline, DEGs, fill = switch)) +
+  geom_col(position = position_dodge(0.75), width = 0.7) +
+  geom_text(aes(label = DEGs), position = position_dodge(0.75), vjust = -0.3, size = pt(6)) +
+  facet_wrap(~ tissue) +
+  scale_fill_manual(values = GERM_COLS, name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = "Compared with", y = "DEGs (padj < 0.05)") +
+  theme_bulk()
+p_global <- ((germ_pca("Liver") + germ_pca("Brain")) + plot_layout(guides = "collect")) /
+  (p_e2like + p_direct) + plot_annotation(tag_levels = "a") &
+  theme(legend.position = "bottom", plot.tag = element_text(size = 8, face = "bold"))
+save_plot(p_global, file.path(FIG_DIR, "deseq2", "germline_global_position"), "full", 142)
+p_global
+```
+
+`direct` is fitted with every switch mouse (the `GERM_MALES_ONLY` switch does not refit it).
+
+**Sex dominates liver PC1.** The female switch livers (Cre and GFP) separate from every male liver, and all EFAD mice are male. Any whole-transcriptome distance between switch and EFAD groups therefore partly reflects sex. The direct model adjusts for sex, but the sex effect is estimated from the switch mice alone. To see the comparison with sex removed, set `GERM_MALES_ONLY <- TRUE`: 5 Cre and 2 GFP livers remain.
+
+## Gene by gene: switch effect vs germline effect
+
+Each gene's switch effect (Cre vs GFP, 2025-10 only, so the run plays no part) is plotted against its germline effect, E2 vs E4 and E3 vs E4. If the switch reproduced germline E2, the points would lie along the diagonal. Genes in the APOE-liver sets (@sec-effect-size) are coloured.
+
+```{r germ-concordance, fig.width = 6.85, fig.height = 3.4}
+liver_within <- fits$fit[[match("Liver", fits$tissue)]]$within
+germ_res <- germline |> dplyr::filter(tissue == "Liver", b == "E4") |>
+  mutate(label = paste("Germline", a, "vs", b))
+conc <- pmap(list(germ_res$res, germ_res$label), \(r, lab) {
+  ids <- intersect(rownames(r)[!is.na(r$stat)], rownames(liver_within)[!is.na(liver_within$stat)])
+  tibble(ensemblID = ids, germline = lab,
+         lfc_switch = liver_within[ids, "log2FoldChange"], lfc_germ = r[ids, "log2FoldChange"],
+         stat_switch = liver_within[ids, "stat"], stat_germ = r[ids, "stat"])
+}) |> bind_rows() |>
+  left_join(dplyr::select(apoe_member, ensemblID, set, basis), by = "ensemblID") |>
+  left_join(dplyr::select(id2name, ensemblID, Symbol), by = "ensemblID")
+conc_r <- conc |> group_by(germline) |>
+  summarise(n = n(), spearman_stat = cor(stat_switch, stat_germ, method = "spearman"),
+            spearman_apoe_sets = cor(stat_switch[!is.na(set)], stat_germ[!is.na(set)], method = "spearman"),
+            .groups = "drop")
+write_csv(conc_r, file.path(CSV_DIR, "deseq2", "germline_switch_concordance.csv"))
+conc_r
+
+SET_COLS <- set_names(colorRampPalette(c("#1B7837", "#2166AC", "#762A83", "#B2182B", "#E08214",
+                                         "#8C510A", "#35978F"))(nrow(APOE_LIVER_SETS)),
+                      APOE_LIVER_SETS$set)
+lim <- 3
+p_conc <- ggplot(conc, aes(pmax(pmin(lfc_germ, lim), -lim), pmax(pmin(lfc_switch, lim), -lim))) +
+  geom_hline(yintercept = 0, linewidth = 0.25) + geom_vline(xintercept = 0, linewidth = 0.25) +
+  geom_abline(slope = 1, linetype = 2, linewidth = 0.25, colour = "grey40") +
+  geom_point(data = dplyr::filter(conc, is.na(set)), colour = "grey85", size = 0.3, stroke = 0) +
+  geom_point(data = dplyr::filter(conc, !is.na(set)), aes(colour = set), size = 0.6, stroke = 0) +
+  geom_text(data = conc_r, aes(x = -lim, y = lim, label = sprintf("rho = %.2f (all)\nrho = %.2f (APOE-liver sets)",
+                                                                   spearman_stat, spearman_apoe_sets)),
+            hjust = 0, vjust = 1, size = pt(6), inherit.aes = FALSE, lineheight = 0.9) +
+  facet_wrap(~ germline) +
+  scale_colour_manual(values = SET_COLS, name = NULL) +
+  coord_equal(xlim = c(-lim, lim), ylim = c(-lim, lim)) +
+  labs(x = "Germline log2FC", y = "Switch log2FC (Cre / GFP, 2025-10 only)") +
+  theme_bulk() + theme(legend.position = "right", legend.key.size = unit(2.5, "mm")) +
+  guides(colour = guide_legend(ncol = 1, override.aes = list(size = 1.5)))
+save_plot(p_conc, file.path(FIG_DIR, "deseq2", "germline_switch_concordance"), "full", 86)
+p_conc
+```
+
+Rho is the Spearman correlation of the Wald statistics. log2FC values beyond ±3 are drawn at the edge.
+
+## APOE-liver pathways per sample
+
+Each sample's score for each APOE-liver set is the mean z of the set's genes, on variance-stabilised data across the 2025-10 livers. Groups run left to right from E4 to E2.
+
+```{r germ-pathways, fig.width = 6.85, fig.height = 6.2}
+liver_v <- germ_vst$Liver
+z <- t(scale(t(liver_v$vst)))
+path_scores <- apoe_sets |>
+  transmute(set, basis, score = map(genes, \(g) {
+    g <- intersect(g, rownames(z))
+    tibble(sample = colnames(z), group = liver_v$meta$group, sex = liver_v$meta$sex,
+           n_genes = length(g), score = colMeans(z[g, , drop = FALSE]))
+  })) |> unnest(score) |>
+  mutate(set = factor(set, levels = APOE_LIVER_SETS$set))
+write_csv(path_scores, file.path(CSV_DIR, "deseq2", "germline_apoe_liver_set_scores.csv"))
+
+# descriptive contrasts on the scores (Welch t; n = 3 per EFAD group, so germline p values are weak)
+tt <- function(x, y) if (length(x) > 1 && length(y) > 1) t.test(x, y)$p.value else NA_real_
+path_stats <- path_scores |> group_by(basis, set) |>
+  summarise(cre_minus_gfp = mean(score[group == "Switch Cre"]) - mean(score[group == "Switch GFP"]),
+            p_cre_vs_gfp  = tt(score[group == "Switch Cre"], score[group == "Switch GFP"]),
+            e2_minus_e4   = mean(score[group == "EFAD E2"]) - mean(score[group == "EFAD E4"]),
+            p_e2_vs_e4    = tt(score[group == "EFAD E2"], score[group == "EFAD E4"]),
+            gfp_minus_e4  = mean(score[group == "Switch GFP"]) - mean(score[group == "EFAD E4"]),
+            cre_minus_e2  = mean(score[group == "Switch Cre"]) - mean(score[group == "EFAD E2"]),
+            .groups = "drop") |>
+  mutate(switch_same_direction_as_germline = sign(cre_minus_gfp) == sign(e2_minus_e4))
+write_csv(path_stats, file.path(CSV_DIR, "deseq2", "germline_apoe_liver_set_stats.csv"))
+path_stats |> mutate(across(where(is.double), \(x) signif(x, 2)))
+
+p_paths <- ggplot(path_scores, aes(group, score, colour = group)) +
+  geom_hline(yintercept = 0, linewidth = 0.25, linetype = 2) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.3, width = 0.6, colour = "grey50") +
+  geom_point(aes(shape = sex), size = 0.8, position = position_jitter(width = 0.15, seed = 1)) +
+  facet_wrap(~ set, ncol = 5, labeller = label_wrap_gen(22)) +
+  scale_colour_manual(values = GERM_COLS, guide = "none") +
+  scale_shape_manual(values = c(Female = 1, Male = 16), name = NULL) +
+  labs(x = NULL, y = "Set score (mean z)") +
+  theme_bulk(6.5) + theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+                          strip.text = element_text(size = 6), legend.position = "top")
+save_plot(p_paths, file.path(FIG_DIR, "deseq2", "germline_apoe_liver_set_scores"), "full", 158)
+p_paths
+```
+
+The last three sets (OXPHOS, urea cycle, interferon-γ) were chosen from this dataset (@sec-effect-size).
+
+## APOE-liver candidate genes per group
+
+The genes come from the effect-size candidates in @sec-effect-size that are in an APOE-liver set and reach nominal p < 0.05 in the main model or in the 2025-10-only test. Each tile is the group mean z (2025-10 livers), so you can see, gene by gene, whether Cre sits with E4, with E2, or apart from both.
+
+```{r germ-heatmap, fig.width = 5.1, fig.height = 8.4}
+hm_genes <- es_genes |> dplyr::filter(!is.na(apoe_set), ev_nominal_main %in% TRUE | ev_nominal_oct %in% TRUE)
+hm <- z[hm_genes$ensemblID, , drop = FALSE] |> as_tibble(rownames = "ensemblID") |>
+  pivot_longer(-ensemblID, names_to = "sample", values_to = "z") |>
+  mutate(group = liver_v$meta[sample, "group"]) |>
+  group_by(ensemblID, group) |> summarise(z = mean(z), .groups = "drop") |>
+  left_join(dplyr::select(hm_genes, ensemblID, Symbol, apoe_set, log2FC), by = "ensemblID") |>
+  mutate(apoe_set = factor(apoe_set, levels = APOE_LIVER_SETS$set),
+         Symbol = fct_reorder(Symbol, log2FC))
+p_hm <- ggplot(hm, aes(group, Symbol, fill = z)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  facet_grid(apoe_set ~ ., scales = "free_y", space = "free_y", switch = "y",
+             labeller = label_wrap_gen(34)) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-1.5, 1.5),
+                       oob = scales::squish, name = "Mean z") +
+  scale_x_discrete(position = "top") +
+  labs(x = NULL, y = NULL) +
+  theme_bulk(6.5) +
+  theme(axis.text.x.top = element_text(angle = 45, hjust = 0, size = 6),
+        axis.text.y = element_text(face = "italic", size = 6), axis.line = element_blank(),
+        axis.ticks = element_blank(), strip.placement = "outside",
+        strip.text.y.left = element_text(angle = 0, hjust = 1, size = 6),
+        panel.spacing = unit(0.5, "mm"))
+hm_h <- min(240, 30 + 3.6 * nrow(hm_genes) + 1.5 * n_distinct(hm_genes$apoe_set))
+save_plot(p_hm, file.path(FIG_DIR, "deseq2", "germline_candidate_gene_heatmap"), 130, hm_h)
+p_hm
+```
+
+```{r}
+#| include: false
+ckpt_save("07")
+```

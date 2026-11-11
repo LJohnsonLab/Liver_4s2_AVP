@@ -1,0 +1,15 @@
+# References {.unnumbered}
+
+- Hansen KD, Irizarry RA, Wu Z (2012). Removing technical variability in RNA-seq data using conditional quantile normalization. *Biostatistics* 13:204–216.
+- Love MI, Huber W, Anders S (2014). Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2. *Genome Biology* 15:550.
+- Zhu A, Ibrahim JG, Love MI (2019). Heavy-tailed prior distributions for sequence count data: removing the noise and preserving large differences (apeglm). *Bioinformatics* 35:2084–2092.
+- Risso D, Ngai J, Speed TP, Dudoit S (2014). Normalization of RNA-seq data using factor analysis of control genes or samples (RUVSeq). *Nature Biotechnology* 32:896–902.
+- Eisenberg E, Levanon EY (2013). Human housekeeping genes, revisited. *Trends in Genetics* 29:569–574.
+- Subramanian A, et al. (2005). Gene set enrichment analysis: a knowledge-based approach for interpreting genome-wide expression profiles. *PNAS* 102:15545–15550.
+- Wu D, Smyth GK (2012). Camera: a competitive gene set test accounting for inter-gene correlation. *Nucleic Acids Research* 40:e133.
+- Yu G, Wang LG, Han Y, He QY (2012). clusterProfiler: an R package for comparing biological themes among gene clusters. *OMICS* 16:284–287.
+- Dobin A, et al. (2013). STAR: ultrafast universal RNA-seq aligner. *Bioinformatics* 29:15–21.
+- Kim D, et al. (2019). Graph-based genome alignment and genotyping with HISAT2 and HISAT-genotype. *Nature Biotechnology* 37:907–915.
+- Mahley RW, Rall SC Jr (2000). Apolipoprotein E: far more than a lipid transport protein. *Annual Review of Genomics and Human Genetics* 1:507–537.
+- Mahley RW (2016). Apolipoprotein E: from cardiovascular disease to neurodegenerative disorders. *Journal of Molecular Medicine* 94:739–746.
+- Griffith M, et al. (2015). Informatics for RNA sequencing: a web resource for analysis on the cloud (rnabio.org). *PLoS Computational Biology* 11:e1004393.
