@@ -268,7 +268,10 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
   <li><a href="#volcano-plots" id="toc-volcano-plots" class="nav-link" data-scroll-target="#volcano-plots"><span class="header-section-number">4.2</span> Volcano plots</a></li>
   <li><a href="#normalised-counts" id="toc-normalised-counts" class="nav-link" data-scroll-target="#normalised-counts"><span class="header-section-number">4.3</span> Normalised counts</a></li>
   <li><a href="#sample-distances" id="toc-sample-distances" class="nav-link" data-scroll-target="#sample-distances"><span class="header-section-number">4.4</span> Sample distances</a></li>
-  <li><a href="#pca" id="toc-pca" class="nav-link" data-scroll-target="#pca"><span class="header-section-number">4.5</span> PCA</a></li>
+  <li><a href="#pca" id="toc-pca" class="nav-link" data-scroll-target="#pca"><span class="header-section-number">4.5</span> PCA</a>
+  <ul class="collapse">
+  <li><a href="#pca-within-each-sex" id="toc-pca-within-each-sex" class="nav-link" data-scroll-target="#pca-within-each-sex"><span class="header-section-number">4.5.1</span> PCA within each sex</a></li>
+  </ul></li>
   <li><a href="#significant-gene-heatmap" id="toc-significant-gene-heatmap" class="nav-link" data-scroll-target="#significant-gene-heatmap"><span class="header-section-number">4.6</span> Significant-gene heatmap</a></li>
   </ul>
 </nav>
@@ -544,33 +547,69 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 </div>
 </div>
 </div>
+<section id="pca-within-each-sex" class="level3" data-number="4.5.1">
+<h3 data-number="4.5.1" class="anchored" data-anchor-id="pca-within-each-sex"><span class="header-section-number">4.5.1</span> PCA within each sex</h3>
+<p>Sex separates the liver samples strongly, so here PCA is rerun separately for males and for females: the 500 most variable genes <em>within that sex</em>, from the same run-offset-corrected rlog values. PC1 can then no longer be the sex difference.</p>
+<div class="cell">
+<details class="code-fold">
+<summary>Code</summary>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb7"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>pca_within_sex <span class="ot">&lt;-</span> <span class="cf">function</span>(rld, tissue, s, <span class="at">n_top =</span> <span class="dv">500</span>) {</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  r  <span class="ot">&lt;-</span> rld[, rld<span class="sc">$</span>sex <span class="sc">==</span> s]</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  v  <span class="ot">&lt;-</span> <span class="fu">assay</span>(r)[<span class="fu">head</span>(<span class="fu">order</span>(<span class="fu">rowVars</span>(<span class="fu">assay</span>(r)), <span class="at">decreasing =</span> <span class="cn">TRUE</span>), n_top), ]</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  pc <span class="ot">&lt;-</span> <span class="fu">prcomp</span>(<span class="fu">t</span>(v))</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>  ve <span class="ot">&lt;-</span> <span class="fu">round</span>(<span class="dv">100</span> <span class="sc">*</span> pc<span class="sc">$</span>sdev<span class="sc">^</span><span class="dv">2</span> <span class="sc">/</span> <span class="fu">sum</span>(pc<span class="sc">$</span>sdev<span class="sc">^</span><span class="dv">2</span>), <span class="dv">1</span>)</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">tibble</span>(<span class="at">name =</span> <span class="fu">colnames</span>(r), <span class="at">PC1 =</span> pc<span class="sc">$</span>x[, <span class="dv">1</span>], <span class="at">PC2 =</span> pc<span class="sc">$</span>x[, <span class="dv">2</span>], <span class="at">cmp_group =</span> r<span class="sc">$</span>cmp_group) <span class="sc">|&gt;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="fu">ggplot</span>(<span class="fu">aes</span>(PC1, PC2, <span class="at">colour =</span> cmp_group)) <span class="sc">+</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="fu">geom_point</span>(<span class="at">size =</span> <span class="fl">1.6</span>) <span class="sc">+</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    <span class="fu">geom_text_repel</span>(<span class="fu">aes</span>(<span class="at">label =</span> name), <span class="at">size =</span> <span class="fu">pt</span>(<span class="dv">6</span>), <span class="at">show.legend =</span> <span class="cn">FALSE</span>,</span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>                    <span class="at">segment.size =</span> <span class="fl">0.2</span>, <span class="at">max.overlaps =</span> <span class="cn">Inf</span>) <span class="sc">+</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    <span class="fu">scale_colour_manual</span>(<span class="at">values =</span> CMP_COLS, <span class="at">drop =</span> <span class="cn">FALSE</span>) <span class="sc">+</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>    <span class="fu">labs</span>(<span class="at">title =</span> <span class="fu">sprintf</span>(<span class="st">"%s, %s (n = %d)"</span>, tissue, <span class="fu">tolower</span>(s), <span class="fu">ncol</span>(r)),</span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>         <span class="at">x =</span> <span class="fu">sprintf</span>(<span class="st">"PC1 (%s%%)"</span>, ve[<span class="dv">1</span>]), <span class="at">y =</span> <span class="fu">sprintf</span>(<span class="st">"PC2 (%s%%)"</span>, ve[<span class="dv">2</span>]), <span class="at">colour =</span> <span class="cn">NULL</span>) <span class="sc">+</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    <span class="fu">theme_bulk</span>()</span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>p_pca_sex <span class="ot">&lt;-</span> <span class="fu">expand_grid</span>(<span class="at">tissue =</span> <span class="fu">names</span>(rlds), <span class="at">sex =</span> <span class="fu">c</span>(<span class="st">"Male"</span>, <span class="st">"Female"</span>)) <span class="sc">|&gt;</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>  <span class="fu">pmap</span>(\(tissue, sex) <span class="fu">pca_within_sex</span>(rlds[[tissue]]<span class="sc">$</span>rld, tissue, sex)) <span class="sc">|&gt;</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>  <span class="fu">wrap_plots</span>(<span class="at">ncol =</span> <span class="dv">2</span>, <span class="at">guides =</span> <span class="st">"collect"</span>) <span class="sc">&amp;</span> <span class="fu">theme</span>(<span class="at">legend.position =</span> <span class="st">"bottom"</span>)</span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="fu">save_plot</span>(p_pca_sex, <span class="fu">file.path</span>(FIG_DIR, <span class="st">"qc"</span>, <span class="st">"pca_rlog_by_sex"</span>), <span class="st">"full"</span>, <span class="dv">142</span>)</span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>p_pca_sex</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</details>
+<div class="cell-output-display">
+<div>
+<figure class="figure">
+<p><img src="04-de-results_files/figure-html/pca-by-sex-1.png" class="img-fluid figure-img" width="643"></p>
+</figure>
+</div>
+</div>
+</div>
+</section>
 </section>
 <section id="significant-gene-heatmap" class="level2" data-number="4.6">
 <h2 data-number="4.6" class="anchored" data-anchor-id="significant-gene-heatmap"><span class="header-section-number">4.6</span> Significant-gene heatmap</h2>
 <div class="cell">
 <details class="code-fold">
 <summary>Code</summary>
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb7"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Tutorial: heatmap of significant genes (rlog): the top 50 genes by padj among</span></span>
-<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="co"># padj &lt; PADJ_CUT (0.05), row-scaled.</span></span>
-<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>sig_heatmap <span class="ot">&lt;-</span> <span class="cf">function</span>(rld, de, tissue, <span class="at">n =</span> <span class="dv">50</span>) {</span>
-<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  top <span class="ot">&lt;-</span> de <span class="sc">|&gt;</span> dplyr<span class="sc">::</span><span class="fu">filter</span>(padj <span class="sc">&lt;</span> PADJ_CUT) <span class="sc">|&gt;</span> <span class="fu">slice_min</span>(padj, <span class="at">n =</span> n, <span class="at">with_ties =</span> <span class="cn">FALSE</span>)</span>
-<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">nrow</span>(top) <span class="sc">&lt;</span> <span class="dv">2</span>) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
-<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>  mat <span class="ot">&lt;-</span> <span class="fu">assay</span>(rld)[top<span class="sc">$</span>ensemblID, ]</span>
-<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>  <span class="fu">rownames</span>(mat) <span class="ot">&lt;-</span> top<span class="sc">$</span>Symbol</span>
-<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>  ann <span class="ot">&lt;-</span> <span class="fu">as.data.frame</span>(<span class="fu">colData</span>(rld))[, <span class="fu">c</span>(<span class="st">"cmp_group"</span>, <span class="st">"sex"</span>)]</span>
-<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>  ord <span class="ot">&lt;-</span> <span class="fu">order</span>(ann<span class="sc">$</span>cmp_group, ann<span class="sc">$</span>sex)</span>
-<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>  ph <span class="ot">&lt;-</span> <span class="fu">pheatmap</span>(mat[, ord], <span class="at">scale =</span> <span class="st">"row"</span>, <span class="at">cluster_cols =</span> <span class="cn">FALSE</span>, <span class="at">annotation_col =</span> ann[ord, ],</span>
-<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>                 <span class="at">annotation_colors =</span> anno_cols,</span>
-<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>                 <span class="at">gaps_col =</span> <span class="fu">cumsum</span>(<span class="fu">table</span>(ann<span class="sc">$</span>cmp_group))[<span class="sc">-</span><span class="fu">nlevels</span>(ann<span class="sc">$</span>cmp_group)],</span>
-<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>                 <span class="at">color =</span> <span class="fu">colorRampPalette</span>(<span class="fu">c</span>(<span class="st">"#2166AC"</span>, <span class="st">"white"</span>, <span class="st">"#B2182B"</span>))(<span class="dv">101</span>),</span>
-<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>                 <span class="at">breaks =</span> <span class="fu">seq</span>(<span class="sc">-</span><span class="dv">2</span>, <span class="dv">2</span>, <span class="at">length.out =</span> <span class="dv">102</span>), <span class="at">fontsize =</span> <span class="dv">6</span>, <span class="at">fontfamily =</span> FONT,</span>
-<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>                 <span class="at">border_color =</span> <span class="cn">NA</span>, <span class="at">treeheight_row =</span> <span class="dv">10</span>, <span class="at">main =</span> tissue, <span class="at">silent =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>  <span class="fu">save_pheatmap</span>(ph, <span class="fu">file.path</span>(FIG_DIR, <span class="st">"deseq2"</span>, <span class="fu">sprintf</span>(<span class="st">"sig_gene_heatmap_%s"</span>, <span class="fu">tolower</span>(tissue))),</span>
-<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>                <span class="st">"single"</span>, <span class="fu">max</span>(<span class="dv">60</span>, <span class="fl">2.6</span> <span class="sc">*</span> <span class="fu">nrow</span>(top) <span class="sc">+</span> <span class="dv">30</span>))</span>
-<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>  ph</span>
-<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>sig_hms <span class="ot">&lt;-</span> <span class="fu">pmap</span>(<span class="fu">list</span>(<span class="fu">map</span>(rlds, <span class="st">"rld"</span>), fits<span class="sc">$</span>de, fits<span class="sc">$</span>tissue), sig_heatmap) <span class="sc">|&gt;</span> <span class="fu">compact</span>()</span>
-<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="fu">walk</span>(sig_hms, \(ph) { grid<span class="sc">::</span><span class="fu">grid.newpage</span>(); grid<span class="sc">::</span><span class="fu">grid.draw</span>(ph<span class="sc">$</span>gtable) })</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb8"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Tutorial: heatmap of significant genes (rlog): the top 50 genes by padj among</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="co"># padj &lt; PADJ_CUT (0.05), row-scaled.</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>sig_heatmap <span class="ot">&lt;-</span> <span class="cf">function</span>(rld, de, tissue, <span class="at">n =</span> <span class="dv">50</span>) {</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>  top <span class="ot">&lt;-</span> de <span class="sc">|&gt;</span> dplyr<span class="sc">::</span><span class="fu">filter</span>(padj <span class="sc">&lt;</span> PADJ_CUT) <span class="sc">|&gt;</span> <span class="fu">slice_min</span>(padj, <span class="at">n =</span> n, <span class="at">with_ties =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">nrow</span>(top) <span class="sc">&lt;</span> <span class="dv">2</span>) <span class="fu">return</span>(<span class="cn">NULL</span>)</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>  mat <span class="ot">&lt;-</span> <span class="fu">assay</span>(rld)[top<span class="sc">$</span>ensemblID, ]</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>  <span class="fu">rownames</span>(mat) <span class="ot">&lt;-</span> top<span class="sc">$</span>Symbol</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>  ann <span class="ot">&lt;-</span> <span class="fu">as.data.frame</span>(<span class="fu">colData</span>(rld))[, <span class="fu">c</span>(<span class="st">"cmp_group"</span>, <span class="st">"sex"</span>)]</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>  ord <span class="ot">&lt;-</span> <span class="fu">order</span>(ann<span class="sc">$</span>cmp_group, ann<span class="sc">$</span>sex)</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>  ph <span class="ot">&lt;-</span> <span class="fu">pheatmap</span>(mat[, ord], <span class="at">scale =</span> <span class="st">"row"</span>, <span class="at">cluster_cols =</span> <span class="cn">FALSE</span>, <span class="at">annotation_col =</span> ann[ord, ],</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>                 <span class="at">annotation_colors =</span> anno_cols,</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>                 <span class="at">gaps_col =</span> <span class="fu">cumsum</span>(<span class="fu">table</span>(ann<span class="sc">$</span>cmp_group))[<span class="sc">-</span><span class="fu">nlevels</span>(ann<span class="sc">$</span>cmp_group)],</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>                 <span class="at">color =</span> <span class="fu">colorRampPalette</span>(<span class="fu">c</span>(<span class="st">"#2166AC"</span>, <span class="st">"white"</span>, <span class="st">"#B2182B"</span>))(<span class="dv">101</span>),</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>                 <span class="at">breaks =</span> <span class="fu">seq</span>(<span class="sc">-</span><span class="dv">2</span>, <span class="dv">2</span>, <span class="at">length.out =</span> <span class="dv">102</span>), <span class="at">fontsize =</span> <span class="dv">6</span>, <span class="at">fontfamily =</span> FONT,</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>                 <span class="at">border_color =</span> <span class="cn">NA</span>, <span class="at">treeheight_row =</span> <span class="dv">10</span>, <span class="at">main =</span> tissue, <span class="at">silent =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>  <span class="fu">save_pheatmap</span>(ph, <span class="fu">file.path</span>(FIG_DIR, <span class="st">"deseq2"</span>, <span class="fu">sprintf</span>(<span class="st">"sig_gene_heatmap_%s"</span>, <span class="fu">tolower</span>(tissue))),</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>                <span class="st">"single"</span>, <span class="fu">max</span>(<span class="dv">60</span>, <span class="fl">2.6</span> <span class="sc">*</span> <span class="fu">nrow</span>(top) <span class="sc">+</span> <span class="dv">30</span>))</span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>  ph</span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>sig_hms <span class="ot">&lt;-</span> <span class="fu">pmap</span>(<span class="fu">list</span>(<span class="fu">map</span>(rlds, <span class="st">"rld"</span>), fits<span class="sc">$</span>de, fits<span class="sc">$</span>tissue), sig_heatmap) <span class="sc">|&gt;</span> <span class="fu">compact</span>()</span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="fu">walk</span>(sig_hms, \(ph) { grid<span class="sc">::</span><span class="fu">grid.newpage</span>(); grid<span class="sc">::</span><span class="fu">grid.draw</span>(ph<span class="sc">$</span>gtable) })</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 </div>
 

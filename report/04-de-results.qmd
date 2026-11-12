@@ -192,6 +192,33 @@ save_plot(p_pca, file.path(FIG_DIR, "qc", "pca_rlog"), "full", 80)
 p_pca
 ```
 
+### PCA within each sex
+
+Sex separates the liver samples strongly, so here PCA is rerun separately for males and for females: the 500 most variable genes *within that sex*, from the same run-offset-corrected rlog values. PC1 can then no longer be the sex difference.
+
+```{r pca-by-sex, fig.width = 6.7, fig.height = 5.6}
+pca_within_sex <- function(rld, tissue, s, n_top = 500) {
+  r  <- rld[, rld$sex == s]
+  v  <- assay(r)[head(order(rowVars(assay(r)), decreasing = TRUE), n_top), ]
+  pc <- prcomp(t(v))
+  ve <- round(100 * pc$sdev^2 / sum(pc$sdev^2), 1)
+  tibble(name = colnames(r), PC1 = pc$x[, 1], PC2 = pc$x[, 2], cmp_group = r$cmp_group) |>
+    ggplot(aes(PC1, PC2, colour = cmp_group)) +
+    geom_point(size = 1.6) +
+    geom_text_repel(aes(label = name), size = pt(6), show.legend = FALSE,
+                    segment.size = 0.2, max.overlaps = Inf) +
+    scale_colour_manual(values = CMP_COLS, drop = FALSE) +
+    labs(title = sprintf("%s, %s (n = %d)", tissue, tolower(s), ncol(r)),
+         x = sprintf("PC1 (%s%%)", ve[1]), y = sprintf("PC2 (%s%%)", ve[2]), colour = NULL) +
+    theme_bulk()
+}
+p_pca_sex <- expand_grid(tissue = names(rlds), sex = c("Male", "Female")) |>
+  pmap(\(tissue, sex) pca_within_sex(rlds[[tissue]]$rld, tissue, sex)) |>
+  wrap_plots(ncol = 2, guides = "collect") & theme(legend.position = "bottom")
+save_plot(p_pca_sex, file.path(FIG_DIR, "qc", "pca_rlog_by_sex"), "full", 142)
+p_pca_sex
+```
+
 ## Significant-gene heatmap
 
 ```{r sig-gene-heatmap}

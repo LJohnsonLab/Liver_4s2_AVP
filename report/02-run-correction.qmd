@@ -8,6 +8,76 @@ source("_common.R")   # chapters render from report/
 ckpt_load("01")
 ```
 
+## How the run effect was tested, and what was concluded {#sec-run-summary}
+
+::: {.callout-note appearance="simple"}
+This section summarises the evidence in this chapter. The figures and tables follow below. Numbers are from the current sample set: B13, GLAD_164 and GLAD_150 excluded.
+:::
+
+**The design problem.** All 10 Cre mice were sequenced in 2025-10. Most GFP controls were sequenced in 2025-04. Treatment and sequencing run are therefore almost completely confounded. Without a way to measure the run difference on its own, any Cre-vs-GFP difference could be the run. Three groups of samples make the run measurable without the treatment:
+
+- **GFP mice sequenced in 2025-10** (liver A11, A12, A13; brain B11, B12): same treatment as the 2025-04 GFP mice, different run.
+- **Bridge mice** (SAD_326, MAD_271): the *same animal's* tissue sequenced in both runs. Any difference between the two copies is technical.
+- **SAD_532**: a GFP mouse sequenced only in 2025-10, in the same run as the Cre mice.
+
+**Test 1. Do samples with the same treatment separate by run?** GFP-only PCA, before correction, with sex regressed out (figure below, panels a–c).
+
+- **Brain: yes.** The 2025-10 GFP brains separate from the 2025-04 brains on PC1, and the two copies of bridge mouse MAD_271 land far apart. Across all AAV brains, run is the largest source of variation (R² 0.84 with PC1).
+- **Liver: no.** The 2025-10 GFP livers mix with the 2025-04 livers, and each bridge mouse's two copies sit next to each other. Run appears only on PC3 (6% of variance, R² 0.71, overlapping with treatment by design). The largest liver axes are sex (PC1, R² 0.98) and mouse-to-mouse differences.
+
+**Test 2. Does a comparison with no treatment difference produce DEGs?** 2025-10 GFP vs 2025-04 GFP, `~ sex + run`, uncorrected. If the runs were equivalent this should give about zero.
+
+- Result: **657 DEGs in liver and 2,245 in brain** (padj < 0.05).
+- 1,192 liver genes and 871 brain genes differ by more than 1.5-fold between runs.
+
+**Test 3. How different is the same mouse in two runs?** Genes differing more than 2-fold between the two copies of a bridge mouse, compared with two different 2025-04 GFP mice.
+
+| | Same mouse, two runs | Different mice, same run (median) |
+|---|---|---|
+| Brain | 200 (MAD_271) | 106 |
+| Liver | 146–181 | 556 |
+
+- **Brain:** the run changes a sample more than swapping in another mouse does.
+- **Liver:** mouse-to-mouse variation is larger than the run effect sample by sample. The run effect in liver is a *consistent* shift across many genes, which is why it still produces hundreds of DEGs in Test 2.
+
+**Test 4. Are the DEGs from the uncorrected Cre-vs-GFP comparison run artifacts?** This is the benchmark below. Cre (2025-10) is compared with single-run 2025-04 GFP mice with no run correction, and each DEG's direction is checked against the same-mouse run difference. If the DEGs were Cre biology, about 50% would match that direction by chance.
+
+| | Uncorrected Cre vs GFP DEGs | Same direction as the run difference |
+|---|---|---|
+| Liver | 3,486 | 88% |
+| Brain | 6,799 | 97% |
+
+**Test 5. Does a GFP mouse in the Cre run look like Cre?** SAD_532 is GFP but was sequenced with the Cre mice. Its deviation from the 2025-04 GFP mean correlates with the uncorrected Cre-vs-GFP difference: r = 0.35 in liver and **0.77 in brain**. A control mouse looks "Cre-like" only because of its run.
+
+**Test 6. Technical read fractions.** Ribosomal-protein and mitochondrial read fractions per sample, by run and extraction batch (Technical differences, below). These show whether library composition differs between runs independently of treatment.
+
+**Conclusion.** The two runs differ systematically in both tissues, but not equally.
+
+- **Brain:** the run effect is strong. It is the largest source of variation, it moves the same mouse further than swapping mice does, and it gives 2,245 DEGs between identically treated mice.
+- **Liver:** the run effect is real but smaller. It is not a major PCA axis and is smaller than the differences between mice. It is consistent across many genes, though: 657 DEGs between identically treated mice, and 88% of the uncorrected Cre-vs-GFP DEGs point in the run direction.
+
+In both tissues, an uncorrected analysis would report the run as a Cre effect. Brain is the within-animal negative control: the switch is hepatocyte-specific, so brain should show essentially no Cre effect. An uncorrected brain Cre-vs-GFP "effect" of 6,799 DEGs, 97% in the run direction, is therefore direct evidence that the uncorrected signal is technical.
+
+**How it was corrected, and how the correction was checked.**
+
+- **Correction.** A per-gene run offset was estimated from all GFP mice (`~ sex + run`) and built into the DESeq2 normalisation factors of the 2025-04 samples. The main model also carries the batch term, so the Cre-vs-GFP fold change is effectively anchored on the GFP mice sequenced in 2025-10.
+- **Check 1, out of sample.** Each 2025-10 GFP mouse in turn was left out of the offset estimate, and its run difference was retested after correction:
+  - liver: 657 → 138, 150 and 479 DEGs (A11, A12, A13);
+  - brain: 2,245 → 2 and 10 DEGs.
+  - Correction removes nearly all of the run in brain and most of it in liver. A13 keeps the most, and it is also the outlying GFP liver in the within-sex PCA.
+- **Check 2, within run.** The corrected Cre-vs-GFP statistics were compared with a 2025-10-only Cre vs GFP comparison, which has no run confound.
+- **Check 3, leave-one-out.** Every result was refit with each 2025-10 GFP mouse removed.
+- **Check 4, alternatives.** RUVg, a technical covariate and cqn were benchmarked against the same held-out samples (benchmark below). None removed the run effect from the confounded design: run-aligned DEGs stayed at 74–97% wherever a method still produced many DEGs. That is why the main model uses the bridge-anchored offset plus batch term.
+- **Floor.** Comparing only the replicate copies gives a "false-positive" floor of 57 (liver) and 365 (brain) DEGs from the run alone (chapter 3).
+
+**After correction, Cre vs GFP gives 0 DEGs at padj < 0.05 in both tissues.** The effect-size candidates in chapter 6 are filtered so that each keeps its direction in the 2025-10-only comparison and in every leave-one-GFP-out refit.
+
+**Limits.**
+
+- The correction rests on few anchors: 3 liver and 2 brain GFP mice sequenced in 2025-10, and 2 liver and 1 brain bridge pairs.
+- Removing the run also removes power. Any true Cre effect that happens to point in the run direction is partly absorbed.
+- The 0-DEG result is therefore "no effect large enough to see past the correction", not evidence of no effect.
+
 ## Technical differences between runs
 
 Ribosomal-protein and mitochondrial read fractions are technical readouts of RNA extraction / library prep. If they track extraction batch rather than treatment, any "translation / OXPHOS" signal in a model without batch is an artifact. Batch is therefore in the design (`design_for()`).
@@ -325,6 +395,101 @@ fits |>
   unnest(top)
 ```
 
+## The run effect at a glance
+
+Four views of the 2025-04 vs 2025-10 sequencing-run difference, all **before correction** (log2 CPM, gene-QC-filtered genes):
+
+- **(a, b) PCA of GFP mice only.** Every mouse got the same treatment, so any separation by run is technical. Sex is regressed out first. Dashed lines join the two runs of the same mouse.
+- **(c) What drives each principal component** (all AAV mice, both tissues): R² of PC1–5 with run, sex and treatment. Every Cre mouse was sequenced in 2025-10, so run and treatment overlap by design. Read the GFP-only PCA (a, b) for the run effect alone.
+- **(d) Significant genes (padj < 0.05)** from a comparison with no treatment difference (2025-10 GFP vs 2025-04 GFP, `~ sex + run`, uncorrected), next to the corrected Cre vs GFP model.
+- **(e) The same mouse in two runs vs different mice in one run**: genes differing more than 2-fold between two samples.
+
+```{r run-effect-overview, fig.width = 6.85, fig.height = 6.2}
+RUN_COLS <- c(`2025-04` = "#4D9221", `2025-10` = "#E08214")
+aav <- meta |> rownames_to_column("sample") |> dplyr::filter(arm == "AAV")
+
+top_var <- function(y, n = 500) y[head(order(rowVars(y), decreasing = TRUE), n), ]
+
+# (a) GFP-only PCA, sex regressed out
+gfp_run_pca <- function(t) {
+  m  <- aav |> dplyr::filter(tissue == t, treatment == "GFP")
+  y  <- limma::removeBatchEffect(lc[[t]][, m$sample], batch = m$sex)
+  pc <- prcomp(t(top_var(y)))
+  ve <- round(100 * pc$sdev^2 / sum(pc$sdev^2))
+  d  <- m |> mutate(PC1 = pc$x[, 1], PC2 = pc$x[, 2])
+  pairs <- d |> group_by(mouse_id) |> dplyr::filter(n_distinct(run) == 2) |> ungroup()
+  ggplot(d, aes(PC1, PC2)) +
+    geom_line(data = pairs, aes(group = mouse_id), linewidth = 0.3, linetype = 2, colour = "grey40") +
+    geom_point(aes(colour = run, shape = sex), size = 1.6) +
+    scale_colour_manual(values = RUN_COLS, name = "Sequencing run") +
+    scale_shape_manual(values = c(Female = 17, Male = 16), name = NULL) +
+    labs(title = sprintf("%s, GFP only (n = %d)", t, nrow(m)),
+         x = sprintf("PC1 (%d%%)", ve[1]), y = sprintf("PC2 (%d%%)", ve[2])) +
+    theme_bulk()
+}
+
+# (b) R^2 of PCs 1-5 with each design factor
+pc_r2 <- map(set_names(TISSUES), \(t) {
+  m  <- aav |> dplyr::filter(tissue == t)
+  pc <- prcomp(t(top_var(lc[[t]][, m$sample])))
+  ve <- 100 * pc$sdev^2 / sum(pc$sdev^2)
+  expand_grid(k = 1:5, factor = c("run", "sex", "treatment")) |>
+    mutate(tissue = t,
+           pc_label = sprintf("PC%d (%.0f%%)", k, ve[k]),
+           r2 = map2_dbl(k, factor, \(k, f) summary(lm(pc$x[, k] ~ m[[f]]))$r.squared))
+}) |> bind_rows() |> mutate(tissue = factor(tissue, levels = TISSUES))
+p_r2 <- ggplot(pc_r2, aes(factor, fct_reorder(pc_label, -k), fill = r2)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", r2)), size = pt(6)) +
+  facet_wrap(~ tissue, scales = "free_y") +
+  scale_fill_gradient(low = "white", high = "#B2182B", limits = c(0, 1), name = "R²") +
+  labs(x = NULL, y = NULL) +
+  theme_bulk() + theme(legend.position = "right")
+
+# (c) DEG counts: no-treatment run comparison vs the corrected Cre vs GFP test
+deg_bars <- fits |>
+  transmute(tissue,
+            `GFP vs GFP,\nrun differs\n(uncorrected)` = map_int(fit, \(f) sum(f$check_before$padj < PADJ_CUT, na.rm = TRUE)),
+            `Cre vs GFP\n(corrected)` = map_int(de, \(d) sum(d$padj < PADJ_CUT, na.rm = TRUE))) |>
+  pivot_longer(-tissue, names_to = "comparison", values_to = "DEGs") |>
+  mutate(comparison = fct_inorder(comparison), tissue = factor(tissue, levels = TISSUES))
+p_degs <- ggplot(deg_bars, aes(comparison, DEGs, fill = comparison)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = scales::comma(DEGs)), vjust = -0.3, size = pt(6)) +
+  facet_wrap(~ tissue) +
+  scale_fill_manual(values = c("#E08214", "#C51B7D"), guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)), labels = scales::comma) +
+  labs(x = NULL, y = "DEGs (padj < 0.05)") +
+  theme_bulk()
+
+# (d) same mouse across runs vs different mice within 2025-04
+bridge_pts <- bind_rows(
+  ref_stats |> transmute(tissue, type, n_genes_2fold),
+  pair_stats |> transmute(tissue, type, n_genes_2fold, mouse_id)) |>
+  mutate(type = factor(type, levels = c("different mice, 2025-04", "same mouse, 2025-04 vs 2025-10")),
+         tissue = factor(tissue, levels = TISSUES))
+p_bridge_cmp <- ggplot(bridge_pts, aes(type, n_genes_2fold)) +
+  geom_boxplot(data = \(d) dplyr::filter(d, type == "different mice, 2025-04"),
+               outlier.shape = NA, width = 0.5, linewidth = 0.3, colour = "grey50") +
+  geom_point(aes(colour = type), size = 1, position = position_jitter(width = 0.12, seed = 1)) +
+  geom_text_repel(data = \(d) dplyr::filter(d, !is.na(mouse_id)), aes(label = mouse_id),
+                  size = pt(6), segment.size = 0.2) +
+  facet_wrap(~ tissue) +
+  scale_colour_manual(values = c("grey40", "#E08214"), guide = "none") +
+  scale_x_discrete(labels = c("Different\nmice,\nsame run", "Same\nmouse,\ntwo runs")) +
+  labs(x = NULL, y = "Genes differing > 2-fold") +
+  theme_bulk()
+
+p_run_effect <- (gfp_run_pca("Liver") + gfp_run_pca("Brain") + plot_layout(guides = "collect")) /
+  p_r2 / (p_degs + p_bridge_cmp) +
+  plot_layout(heights = c(1, 0.8, 1)) +
+  plot_annotation(tag_levels = "a") &
+  theme(plot.tag = element_text(size = 8, face = "bold"))
+save_plot(p_run_effect, file.path(FIG_DIR, "qc", "run_effect_overview"), "full", 160)
+write_csv(pc_r2, file.path(CSV_DIR, "qc", "pc_factor_r2.csv"))
+p_run_effect
+```
+
 ## Aligner comparison: HISAT2 vs STAR
 
 Gene counts for every analysis come from `COUNT_SOURCE` (STAR 2.7.11b, `--quantMode GeneCounts`, unstranded column, on the same fastp-trimmed reads and custom reference / GTF). The tutorial route, HISAT2 + htseq-count *intersection-strict*, is kept here as the internal comparison: the full analysis (batch model, checks) is rerun on those counts to show whether any conclusion depends on the aligner. STAR counts reads overlapping a single gene (htseq *union*-like), so its counts run slightly higher than intersection-strict.
@@ -411,7 +576,7 @@ if (!file.exists(star_file)) {
 
 Question: with Cre (2025-10 run) and GFP (2025-04 run) sequenced in different runs, which correction removes the run effect while keeping Cre biology? Each method is fitted on a fully run-confounded set, and graded only on samples it never saw.
 
-- **Model set**: 2025-10 Cre (10) vs 2025-04 GFP from mice sequenced only once (8; the double-run mice SAD_326 and MAD_271 are left out entirely). The 2025-04 Cre samples are not used: they were different, misgenotyped mice.
+- **Model set**: 2025-10 Cre (10) vs 2025-04 GFP from mice sequenced only once (6; GLAD_164 and GLAD_150 are excluded as germline E2 carriers, and the double-run mice SAD_326 and MAD_271 are left out entirely). The 2025-04 Cre samples are not used: they were different, misgenotyped mice.
 - **Held-out validation**: the double-run mice (same animal in both runs = pure run effect), SAD_532 (2025-10 GFP, single run), and the 2025-10-only Cre vs GFP comparison (no run confound).
 
 Methods:

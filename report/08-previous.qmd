@@ -53,7 +53,7 @@ repro <- map(set_names(TISSUES), prev_pipeline)
 # same-mouse run difference (2025-10 minus 2025-04) from the double-run mice, for every gene:
 # a "DEG" pointing the same way as this is what the run alone would produce
 run_diff_tissue <- function(tissue) {
-  m  <- meta_all |> dplyr::filter(tissue == !!tissue, arm == "AAV", sample != "B13")
+  m  <- meta_all |> dplyr::filter(tissue == !!tissue, arm == "AAV", !sample %in% excluded)
   pr <- m |> group_by(mouse_id) |> dplyr::filter(n_distinct(run) == 2) |> ungroup()
   y  <- log2(t(t(allCounts[, pr$sample]) / estimateSizeFactorsForMatrix(allCounts[, pr$sample])) + 1)
   d  <- map(split(pr, pr$mouse_id), \(b) y[, b$sample[b$run == CRE_RUN]] - y[, b$sample[b$run == GFP_RUN]])

@@ -132,6 +132,35 @@ p_global
 
 **Sex dominates liver PC1.** The female switch livers (Cre and GFP) separate from every male liver, and all EFAD mice are male. Any whole-transcriptome distance between switch and EFAD groups therefore partly reflects sex. The direct model adjusts for sex, but the sex effect is estimated from the switch mice alone. To see the comparison with sex removed, set `GERM_MALES_ONLY <- TRUE`: 5 Cre and 2 GFP livers remain.
 
+### PCA within each sex
+
+The same PCA rerun separately for each sex (500 most variable genes within that sex), so sex no longer drives PC1. Every EFAD mouse is male, so **only the male panels compare the switch mice with germline E2 / E3 / E4**. The female panels contain switch Cre and switch GFP only.
+
+```{r germ-pca-by-sex, fig.width = 6.85, fig.height = 5.6}
+germ_pca_sex <- function(t, s, n_top = 500) {
+  x    <- germ_vst[[t]]
+  keep <- x$meta$sex == s
+  vs   <- x$vst[, keep, drop = FALSE]
+  v    <- vs[head(order(apply(vs, 1, var), decreasing = TRUE), n_top), ]
+  pc   <- prcomp(t(v))
+  ve   <- round(100 * pc$sdev^2 / sum(pc$sdev^2))
+  tibble(PC1 = pc$x[, 1], PC2 = pc$x[, 2], group = x$meta$group[keep]) |>
+    ggplot(aes(PC1, PC2, colour = group)) +
+    geom_point(size = 1.4) +
+    scale_colour_manual(values = GERM_COLS, name = NULL, drop = FALSE) +
+    labs(title = sprintf("%s, %s (n = %d)", t, tolower(s), sum(keep)),
+         x = sprintf("PC1 (%d%%)", ve[1]), y = sprintf("PC2 (%d%%)", ve[2])) +
+    theme_bulk()
+}
+p_germ_pca_sex <- expand_grid(t = c("Liver", "Brain"), s = c("Male", "Female")) |>
+  pmap(germ_pca_sex) |>
+  # female panels hold switch mice only; drop their legend so the male one (all groups) is shown once
+  map_if(\(p) str_detect(p$labels$title, "female"), \(p) p + guides(colour = "none")) |>
+  wrap_plots(ncol = 2, guides = "collect") & theme(legend.position = "bottom")
+save_plot(p_germ_pca_sex, file.path(FIG_DIR, "deseq2", "germline_pca_by_sex"), "full", 142)
+p_germ_pca_sex
+```
+
 ## Gene by gene: switch effect vs germline effect
 
 Each gene's switch effect (Cre vs GFP, 2025-10 only, so the run plays no part) is plotted against its germline effect, E2 vs E4 and E3 vs E4. If the switch reproduced germline E2, the points would lie along the diagonal. Genes in the APOE-liver sets (@sec-effect-size) are coloured.

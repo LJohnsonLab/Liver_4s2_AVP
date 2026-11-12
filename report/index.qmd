@@ -24,9 +24,9 @@ Brain tissue is the within-animal negative control. The switch acts in hepatocyt
 **Primary comparison:** Cre-AAV vs GFP-AAV, run separately in liver and brain. Two Novogene runs are combined, both processed here from raw FASTQ with the same pipeline:
 
 - **2025-10** (X202SC25088042): 10 Cre + 3 GFP mice per tissue, in RNA extraction batches 1 and 2. This run also holds 12-month EFAD germline E2 / E3 / E4 mice, which are not used as controls for the switch.
-- **2025-04** (X202SC25043333, samples prefixed `R1_`): only the 10 GFP mice per tissue are used. The 2025-04 Cre samples are excluded because they were different mice that were misgenotyped. Extraction batch `R1`.
+- **2025-04** (X202SC25043333, samples prefixed `R1_`): only the GFP mice are used: 8 of the 10 per tissue. GLAD_164 and GLAD_150 (R1_A2 / R1_B2, R1_A11 / R1_B11) are excluded as germline E2 carriers. The 2025-04 Cre samples are excluded because they were different mice that were misgenotyped. Extraction batch `R1`.
 
-Two GFP mice, SAD_326 and MAD_271, were sequenced in both runs. They are bridge replicates of the same animals, and every model uses one sample per mouse. Brain B13 is excluded: it is not SAD_326 (APOE genotype mismatch).
+Two GFP mice, SAD_326 and MAD_271, were sequenced in both runs. They are bridge replicates of the same animals, and every model uses one sample per mouse. Brain B13 is excluded: it is not SAD_326 (APOE genotype mismatch). The full exclusion list, with reasons, is `QC_EXCLUDE` in chapter 1.
 
 **The central problem:** every Cre mouse was sequenced in 2025-10, while most GFP controls were sequenced in 2025-04. The main model therefore includes a batch term that fully removes the run difference. With the run removed, the Cre-vs-GFP fold change rests on the three GFP mice sequenced in 2025-10. The 2025-04 GFP mice add replication to the variance estimates.
 

@@ -7,7 +7,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
 
 <meta name="author" content="Akhil Pallerla">
-<meta name="dcterms.date" content="2026-11-11">
+<meta name="dcterms.date" content="2026-11-12">
 
 <title>Liver Switch BulkSeq Analysis</title>
 <style>
@@ -260,7 +260,7 @@ ul.task-list li input[type="checkbox"] {
     <div>
     <div class="quarto-title-meta-heading">Published</div>
     <div class="quarto-title-meta-contents">
-      <p class="date">November 11, 2026</p>
+      <p class="date">November 12, 2026</p>
     </div>
   </div>
   
@@ -297,9 +297,9 @@ ul.task-list li input[type="checkbox"] {
 <p><strong>Primary comparison:</strong> Cre-AAV vs GFP-AAV, run separately in liver and brain. Two Novogene runs are combined, both processed here from raw FASTQ with the same pipeline:</p>
 <ul>
 <li><strong>2025-10</strong> (X202SC25088042): 10 Cre + 3 GFP mice per tissue, in RNA extraction batches 1 and 2. This run also holds 12-month EFAD germline E2 / E3 / E4 mice, which are not used as controls for the switch.</li>
-<li><strong>2025-04</strong> (X202SC25043333, samples prefixed <code>R1_</code>): only the 10 GFP mice per tissue are used. The 2025-04 Cre samples are excluded because they were different mice that were misgenotyped. Extraction batch <code>R1</code>.</li>
+<li><strong>2025-04</strong> (X202SC25043333, samples prefixed <code>R1_</code>): only the GFP mice are used: 8 of the 10 per tissue. GLAD_164 and GLAD_150 (R1_A2 / R1_B2, R1_A11 / R1_B11) are excluded as germline E2 carriers. The 2025-04 Cre samples are excluded because they were different mice that were misgenotyped. Extraction batch <code>R1</code>.</li>
 </ul>
-<p>Two GFP mice, SAD_326 and MAD_271, were sequenced in both runs. They are bridge replicates of the same animals, and every model uses one sample per mouse. Brain B13 is excluded: it is not SAD_326 (APOE genotype mismatch).</p>
+<p>Two GFP mice, SAD_326 and MAD_271, were sequenced in both runs. They are bridge replicates of the same animals, and every model uses one sample per mouse. Brain B13 is excluded: it is not SAD_326 (APOE genotype mismatch). The full exclusion list, with reasons, is <code>QC_EXCLUDE</code> in chapter 1.</p>
 <p><strong>The central problem:</strong> every Cre mouse was sequenced in 2025-10, while most GFP controls were sequenced in 2025-04. The main model therefore includes a batch term that fully removes the run difference. With the run removed, the Cre-vs-GFP fold change rests on the three GFP mice sequenced in 2025-10. The 2025-04 GFP mice add replication to the variance estimates.</p>
 </section>
 <section id="how-this-book-is-organised" class="level2">

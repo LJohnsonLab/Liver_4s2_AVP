@@ -45,7 +45,13 @@ QC_MAD <- 3
 # Samples removed from every downstream step. Flags never drop anything automatically:
 # review the QC plots, then list sample IDs here with the reason.
 QC_EXCLUDE <- c(B13 = paste("sample identity: listed as SAD_326 but reads APOE E2/E2; SAD_326's",
-                            "2025-04 brain (R1_B1) and both livers read E4/E4"))
+                            "2025-04 brain (R1_B1) and both livers read E4/E4"),
+                # germline E2 carriers among the 2025-04 GFP controls (excluded 2026-11-12): not an
+                # E4/E4 baseline. Both tissues of each mouse.
+                R1_A2  = "GLAD_164 (liver): germline E2 carrier",
+                R1_B2  = "GLAD_164 (brain): germline E2 carrier",
+                R1_A11 = "GLAD_150 (liver): germline E2 carrier",
+                R1_B11 = "GLAD_150 (brain): germline E2 carrier")
 
 ## ---- gene QC ----------------------------------------------------------------------------
 # "strict": technical biotypes removed + CPM filter in >= smallest-group samples (default)
